@@ -90,6 +90,42 @@ function safeReadFileBase64(filePath) {
   }
 }
 
+async function generateTitle(conversationId, userMsg, assistantMsg) {
+  try {
+    const url = `${config.API_BASE_URL}/v1/messages`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': config.API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-3-haiku-20240307', // Use fast model for titling
+        max_tokens: 20,
+        messages: [
+          {
+            role: 'user',
+            content: `Please generate a very short, concise title (max 5-7 words) for this conversation based on the first exchange.\n\nUser: ${userMsg}\nAssistant: ${assistantMsg}\n\nTitle:`
+          }
+        ]
+      })
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      const title = data.content[0].text.replace(/^["']|["']$/g, '').trim(); // Remove quotes
+      if (title) {
+        const db = getDb();
+        db.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(title, conversationId);
+        console.log(`[Title] Generated for ${conversationId}: ${title}`);
+      }
+    }
+  } catch (err) {
+    console.error('Failed to generate title:', err);
+  }
+}
+
 router.post('/', async (req, res, next) => {
   const { conversation_id: conversationId, message, attachments } = req.body || {};
 
@@ -344,33 +380,69 @@ router.post('/', async (req, res, next) => {
     res.setHeader('X-Accel-Buffering', 'no');
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-    // 只在已经开始 SSE 输出后才监听 close，避免等待上游响应期间误触发 abort
     req.on('close', () => {
       clientClosed = true;
       controller.abort();
     });
 
     const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let assistantMessage = '';
+
     try {
-      // eslint-disable-next-line no-constant-condition
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         if (clientClosed) break;
-        if (!value) continue;
 
-        const ok = res.write(Buffer.from(value));
-        if (!ok) {
-          await new Promise((resolve) => res.once('drain', resolve));
+        if (value) {
+          res.write(value);
+
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6).trim();
+              if (data === '[DONE]') continue;
+              try {
+                const parsed = JSON.parse(data);
+                if (parsed.type === 'content_block_delta' && parsed.delta && parsed.delta.type === 'text_delta') {
+                  assistantMessage += parsed.delta.text;
+                }
+              } catch (e) {
+                // ignore parse error
+              }
+            }
+          }
         }
       }
     } finally {
+      res.end();
       try {
         reader.releaseLock();
-      } catch (err) {
-        // ignore
+      } catch (e) { }
+
+      // Save to database
+      if (assistantMessage) {
+        try {
+          const msgId = uuidv4();
+          db.prepare(
+            'INSERT INTO messages (id, conversation_id, role, content, has_attachments) VALUES (?, ?, ?, ?, ?)'
+          ).run(msgId, conversationId, 'assistant', assistantMessage, 0);
+
+          db.prepare('UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(conversationId);
+
+          // Check if we should generate a title (if this is the first exchange)
+          const count = db.prepare('SELECT COUNT(*) as count FROM messages WHERE conversation_id = ?').get(conversationId).count;
+          if (count <= 2) {
+            // Generate title asynchronously
+            generateTitle(conversationId, message, assistantMessage);
+          }
+
+        } catch (dbErr) {
+          console.error('Failed to persist assistant message:', dbErr);
+        }
       }
-      res.end();
     }
 
     return undefined;

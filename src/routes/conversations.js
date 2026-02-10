@@ -41,6 +41,9 @@ router.get('/', (req, res, next) => {
 });
 
 router.post('/', (req, res, next) => {
+  console.log('[DEBUG] POST /conversations req.body:', req.body);
+  console.log('[DEBUG] POST /conversations req.userId:', req.userId);
+
   const { title, model } = req.body || {};
   const conversationId = uuidv4();
 
@@ -62,9 +65,10 @@ router.post('/', (req, res, next) => {
       values.push(model);
     }
 
-    db.prepare(`INSERT INTO conversations (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`).run(
-      ...values
-    );
+    const sql = `INSERT INTO conversations (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
+    console.log('[DEBUG] Executing SQL:', sql, 'Values:', values);
+
+    db.prepare(sql).run(...values);
 
     const conversation = db
       .prepare('SELECT id, title, model, created_at, updated_at FROM conversations WHERE id = ?')
@@ -72,7 +76,11 @@ router.post('/', (req, res, next) => {
 
     return res.json(conversation);
   } catch (err) {
-    return next(err);
+    console.error('[ERROR] POST /conversations:', err);
+    if (err.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+      return res.status(401).json({ error: '用户不存在，请重新登录' });
+    }
+    return res.status(500).json({ error: '服务器内部错误', detail: err.message });
   }
 });
 
@@ -270,4 +278,3 @@ router.delete('/:id', (req, res, next) => {
 });
 
 module.exports = router;
-
