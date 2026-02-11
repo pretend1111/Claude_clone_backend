@@ -5,6 +5,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { init: initDb } = require('./db/init');
+const { loadSystemPrompt } = require('./lib/systemPrompt');
 const authRoutes = require('./routes/auth');
 const conversationsRoutes = require('./routes/conversations');
 const chatRoutes = require('./routes/chat');
@@ -22,6 +23,7 @@ fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadsDir, { recursive: true });
 
 initDb();
+loadSystemPrompt(); // 启动时加载系统提示词到内存
 
 const allowedOrigins = new Set([
   'http://localhost:5173',

@@ -68,6 +68,23 @@ function init() {
     CREATE INDEX IF NOT EXISTS idx_attachments_user_id ON attachments(user_id);
   `);
 
+  // === 数据库迁移：上下文管理系统 ===
+  const messageColumns = db.pragma('table_info(messages)');
+  const columnNames = new Set(messageColumns.map(col => col.name));
+
+  if (!columnNames.has('input_tokens')) {
+    db.exec('ALTER TABLE messages ADD COLUMN input_tokens INTEGER DEFAULT 0');
+  }
+  if (!columnNames.has('output_tokens')) {
+    db.exec('ALTER TABLE messages ADD COLUMN output_tokens INTEGER DEFAULT 0');
+  }
+  if (!columnNames.has('is_summary')) {
+    db.exec('ALTER TABLE messages ADD COLUMN is_summary INTEGER DEFAULT 0');
+  }
+  if (!columnNames.has('compacted')) {
+    db.exec('ALTER TABLE messages ADD COLUMN compacted INTEGER DEFAULT 0');
+  }
+
   dbInstance = db;
   return dbInstance;
 }

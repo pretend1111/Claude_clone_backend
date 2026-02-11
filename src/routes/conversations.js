@@ -98,7 +98,7 @@ router.get('/:id', (req, res, next) => {
     const messages = db
       .prepare(
         `
-          SELECT id, role, content, has_attachments, created_at
+          SELECT id, role, content, has_attachments, is_summary, compacted, created_at
           FROM messages
           WHERE conversation_id = ?
           ORDER BY created_at ASC
@@ -272,6 +272,127 @@ router.delete('/:id', (req, res, next) => {
     deleteTx();
 
     return res.json({ success: true });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 删除指定消息及其后续消息
+router.delete('/:id/messages/:messageId', (req, res, next) => {
+  const { id, messageId } = req.params;
+  const db = getDb();
+
+  try {
+    const conversation = db
+      .prepare('SELECT id, user_id FROM conversations WHERE id = ?')
+      .get(id);
+
+    if (!ensureConversationOwner(conversation, req.userId, res)) return undefined;
+
+    // 获取目标消息的 created_at
+    const targetMessage = db
+      .prepare('SELECT id, created_at FROM messages WHERE id = ? AND conversation_id = ?')
+      .get(messageId, id);
+
+    if (!targetMessage) {
+      return res.status(404).json({ error: '消息不存在' });
+    }
+
+    // 找到所有需要删除的消息（目标消息及其后续消息）
+    const messagesToDelete = db
+      .prepare(
+        `
+          SELECT id FROM messages
+          WHERE conversation_id = ? AND created_at >= ?
+          ORDER BY created_at ASC
+        `
+      )
+      .all(id, targetMessage.created_at);
+
+    const messageIds = messagesToDelete.map(m => m.id);
+
+    if (messageIds.length > 0) {
+      const placeholders = messageIds.map(() => '?').join(',');
+
+      // 删除相关附件文件
+      const attachmentRows = db
+        .prepare(
+          `
+            SELECT file_path, file_size FROM attachments
+            WHERE message_id IN (${placeholders})
+          `
+        )
+        .all(...messageIds);
+
+      let totalDeletedSize = 0;
+      for (const row of attachmentRows) {
+        totalDeletedSize += Number(row.file_size) || 0;
+        if (!row.file_path) continue;
+        try {
+          fs.unlinkSync(row.file_path);
+        } catch (err) {
+          if (!err || err.code !== 'ENOENT') {
+            throw err;
+          }
+        }
+      }
+
+      const deleteTx = db.transaction(() => {
+        db.prepare(
+          `DELETE FROM attachments WHERE message_id IN (${placeholders})`
+        ).run(...messageIds);
+
+        db.prepare(
+          `DELETE FROM messages WHERE id IN (${placeholders})`
+        ).run(...messageIds);
+
+        if (totalDeletedSize > 0) {
+          db.prepare(
+            `
+              UPDATE users
+              SET storage_used = CASE
+                WHEN storage_used - ? < 0 THEN 0
+                ELSE storage_used - ?
+              END,
+              updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?
+            `
+          ).run(totalDeletedSize, totalDeletedSize, req.userId);
+        }
+      });
+
+      deleteTx();
+    }
+
+    return res.json({ success: true, deletedCount: messageIds.length });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+const contextManager = require('../lib/contextManager');
+
+router.post('/:id/compact', async (req, res, next) => {
+  const { id } = req.params;
+  const { instruction } = req.body || {};
+  const db = getDb();
+
+  try {
+    const conversation = db
+      .prepare('SELECT id, user_id FROM conversations WHERE id = ?')
+      .get(id);
+
+    if (!ensureConversationOwner(conversation, req.userId, res)) return undefined;
+
+    const result = await contextManager.manualCompact(id, req.userId, instruction);
+
+    return res.json({
+      success: true,
+      summary: result.summary,
+      tokensSaved: result.tokensSaved,
+      messagesCompacted: result.messagesCompacted,
+      message: result.message || '压缩完成',
+    });
   } catch (err) {
     return next(err);
   }

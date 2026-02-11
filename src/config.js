@@ -1,9 +1,30 @@
 require('dotenv').config();
+const path = require('path');
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const API_BASE_URL = process.env.API_BASE_URL || '';
 const API_KEY = process.env.API_KEY || '';
+
+// 系统提示词文件路径
+const SYSTEM_PROMPT_PATH = process.env.SYSTEM_PROMPT_PATH ||
+  path.join(__dirname, 'prompts', 'system-opus-4.6.txt');
+
+// === 上下文管理配置 ===
+const CONTEXT_WINDOW = 200000;
+const MAX_OUTPUT_TOKENS = 16000;
+const SYSTEM_PROMPT_TOKENS = 20000;
+const COMPACTION_THRESHOLD = 0.85;
+const COMPACTION_KEEP_ROUNDS = 10;
+const PRUNING_AGE_ROUNDS = 20;
+const PRUNING_CODE_BLOCK_LIMIT = 2000;
+const COMPACTION_MODEL = 'claude-haiku-4-5-20251001-thinking';
+const MESSAGE_TOKEN_BUDGET = CONTEXT_WINDOW - SYSTEM_PROMPT_TOKENS - MAX_OUTPUT_TOKENS; // 164000
+const COMPACTION_TRIGGER = Math.floor(MESSAGE_TOKEN_BUDGET * COMPACTION_THRESHOLD);     // 139400
+
+// === 工具执行配置 ===
+const TOOL_EXECUTION_TIMEOUT = 30000;
+const TOOL_LOOP_MAX_ROUNDS = 10;
 
 if (!JWT_SECRET) {
   throw new Error('JWT_SECRET is required. Please set it in your .env file.');
@@ -14,5 +35,18 @@ module.exports = {
   JWT_SECRET,
   API_BASE_URL,
   API_KEY,
+  SYSTEM_PROMPT_PATH,
+  CONTEXT_WINDOW,
+  MAX_OUTPUT_TOKENS,
+  SYSTEM_PROMPT_TOKENS,
+  COMPACTION_THRESHOLD,
+  COMPACTION_KEEP_ROUNDS,
+  PRUNING_AGE_ROUNDS,
+  PRUNING_CODE_BLOCK_LIMIT,
+  COMPACTION_MODEL,
+  MESSAGE_TOKEN_BUDGET,
+  COMPACTION_TRIGGER,
+  TOOL_EXECUTION_TIMEOUT,
+  TOOL_LOOP_MAX_ROUNDS,
 };
 
