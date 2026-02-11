@@ -85,6 +85,40 @@ function init() {
     db.exec('ALTER TABLE messages ADD COLUMN compacted INTEGER DEFAULT 0');
   }
 
+  // === 数据库迁移：attachments 表添加 id 列 + 扩展 file_type ===
+  const attachmentColumns = db.pragma('table_info(attachments)');
+  const attachmentColumnNames = new Set(attachmentColumns.map(col => col.name));
+
+  if (!attachmentColumnNames.has('id')) {
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('ALTER TABLE attachments RENAME TO attachments_old');
+    db.exec(`
+      CREATE TABLE attachments (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL,
+        file_type TEXT NOT NULL CHECK (file_type IN ('image', 'document', 'text')),
+        file_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        file_size INTEGER NOT NULL,
+        mime_type TEXT NOT NULL,
+        extracted_text TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id);
+      CREATE INDEX IF NOT EXISTS idx_attachments_user_id ON attachments(user_id);
+    `);
+    db.exec(`
+      INSERT INTO attachments (id, message_id, user_id, file_type, file_name, file_path, file_size, mime_type, extracted_text, created_at)
+      SELECT hex(randomblob(16)), message_id, user_id, file_type, file_name, file_path, file_size, mime_type, extracted_text, created_at
+      FROM attachments_old
+    `);
+    db.exec('DROP TABLE attachments_old');
+    db.exec('PRAGMA foreign_keys = ON');
+    console.log('[DB] Migrated attachments table: added id column, expanded file_type');
+  }
+
   dbInstance = db;
   return dbInstance;
 }

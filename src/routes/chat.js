@@ -8,6 +8,7 @@ const { getDb } = require('../db/init');
 const { getSystemPrompt } = require('../lib/systemPrompt');
 const contextManager = require('../lib/contextManager');
 const { registry: toolRegistry, executor: toolExecutor } = require('../tools');
+const { parseFile, needsParsing, getFormatLabel } = require('../tools/file-parsers');
 
 const router = express.Router();
 
@@ -137,114 +138,45 @@ router.post('/', async (req, res, next) => {
     }
 
     const normalizedAttachments = Array.isArray(attachments) ? attachments : [];
-    const preparedAttachments = [];
-    let totalUploadSize = 0;
 
+    if (normalizedAttachments.length > config.UPLOAD_MAX_FILES_PER_MESSAGE) {
+      return res.status(400).json({ error: `每条消息最多 ${config.UPLOAD_MAX_FILES_PER_MESSAGE} 个附件` });
+    }
+
+    // 验证 fileId 引用并查询附件信息
+    const validatedAttachments = [];
     for (const item of normalizedAttachments) {
-      if (!item || typeof item !== 'object') {
-        return res.status(400).json({ error: 'attachments 参数错误' });
+      if (!item || typeof item !== 'object' || typeof item.fileId !== 'string') {
+        return res.status(400).json({ error: 'attachments 格式错误，需要 { fileId: string }' });
       }
-      if (item.type !== 'image') {
-        return res.status(400).json({ error: '仅支持 image 附件' });
+      const att = db
+        .prepare('SELECT id, user_id, file_type, file_name, file_path, file_size, mime_type FROM attachments WHERE id = ?')
+        .get(item.fileId);
+      if (!att) {
+        return res.status(404).json({ error: `附件 ${item.fileId} 不存在` });
       }
-      if (typeof item.media_type !== 'string' || !item.media_type.startsWith('image/')) {
-        return res.status(400).json({ error: 'media_type 参数错误' });
+      if (att.user_id !== req.userId) {
+        return res.status(403).json({ error: '无权使用该附件' });
       }
-      if (typeof item.data !== 'string' || item.data.length === 0) {
-        return res.status(400).json({ error: 'data 参数错误' });
-      }
-
-      const raw = stripDataUrlPrefix(item.data);
-      const buffer = Buffer.from(raw, 'base64');
-      if (!buffer || buffer.length === 0) {
-        return res.status(400).json({ error: '附件数据解码失败' });
-      }
-
-      totalUploadSize += buffer.length;
-      preparedAttachments.push({
-        file_type: 'image',
-        file_name: typeof item.file_name === 'string' ? item.file_name : 'image',
-        mime_type: item.media_type,
-        buffer,
-      });
-    }
-
-    const currentStorageUsed = Number(user.storage_used) || 0;
-    const storageQuota = Number(user.storage_quota) || 0;
-    if (preparedAttachments.length > 0 && currentStorageUsed + totalUploadSize > storageQuota) {
-      return res.status(413).json({ error: '存储空间不足' });
-    }
-
-    const dataDir = path.join(__dirname, '..', '..', 'data');
-    const uploadsDir = path.join(dataDir, 'uploads');
-    const userUploadsDir = path.join(uploadsDir, req.userId);
-    fs.mkdirSync(userUploadsDir, { recursive: true });
-
-    const writtenFiles = [];
-    for (const attachment of preparedAttachments) {
-      const ext = getExtFromMediaType(attachment.mime_type, attachment.file_name);
-      const filename = `${uuidv4()}.${ext}`;
-      const filePath = path.join(userUploadsDir, filename);
-      fs.writeFileSync(filePath, attachment.buffer);
-      writtenFiles.push(filePath);
-      attachment.file_path = filePath;
-      attachment.file_size = attachment.buffer.length;
-      delete attachment.buffer;
+      validatedAttachments.push(att);
     }
 
     const messageId = uuidv4();
-    const hasAttachments = preparedAttachments.length > 0 ? 1 : 0;
+    const hasAttachments = validatedAttachments.length > 0 ? 1 : 0;
 
-    try {
-      const tx = db.transaction(() => {
-        db.prepare(
-          'INSERT INTO messages (id, conversation_id, role, content, has_attachments) VALUES (?, ?, ?, ?, ?)'
-        ).run(messageId, conversationId, 'user', message, hasAttachments);
+    const tx = db.transaction(() => {
+      db.prepare(
+        'INSERT INTO messages (id, conversation_id, role, content, has_attachments) VALUES (?, ?, ?, ?, ?)'
+      ).run(messageId, conversationId, 'user', message, hasAttachments);
 
-        db.prepare('UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(conversationId);
+      db.prepare('UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(conversationId);
 
-        for (const attachment of preparedAttachments) {
-          db.prepare(
-            `
-              INSERT INTO attachments (
-                message_id, user_id, file_type, file_name, file_path, file_size, mime_type
-              ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            `
-          ).run(
-            messageId,
-            req.userId,
-            attachment.file_type,
-            attachment.file_name,
-            attachment.file_path,
-            attachment.file_size,
-            attachment.mime_type
-          );
-        }
-
-        if (preparedAttachments.length > 0) {
-          db.prepare(
-            `
-              UPDATE users
-              SET storage_used = storage_used + ?, updated_at = CURRENT_TIMESTAMP
-              WHERE id = ?
-            `
-          ).run(totalUploadSize, req.userId);
-        }
-      });
-
-      tx();
-    } catch (err) {
-      for (const filePath of writtenFiles) {
-        try {
-          fs.unlinkSync(filePath);
-        } catch (unlinkErr) {
-          if (!unlinkErr || unlinkErr.code !== 'ENOENT') {
-            // ignore
-          }
-        }
+      for (const att of validatedAttachments) {
+        db.prepare('UPDATE attachments SET message_id = ? WHERE id = ?').run(messageId, att.id);
       }
-      throw err;
-    }
+    });
+
+    tx();
 
     // === 自动 compaction 检查 ===
     let compactionResult = null;
@@ -276,7 +208,7 @@ router.post('/', async (req, res, next) => {
       const attachmentRows = db
         .prepare(
           `
-            SELECT message_id, file_path, mime_type
+            SELECT message_id, file_type, file_name, file_path, mime_type
             FROM attachments
             WHERE message_id IN (${placeholders})
             ORDER BY created_at ASC
@@ -289,6 +221,8 @@ router.post('/', async (req, res, next) => {
           attachmentsByMessageId.set(row.message_id, []);
         }
         attachmentsByMessageId.get(row.message_id).push({
+          file_type: row.file_type,
+          file_name: row.file_name,
           file_path: row.file_path,
           mime_type: row.mime_type,
         });
@@ -305,17 +239,62 @@ router.post('/', async (req, res, next) => {
       const parts = [];
       parts.push({ type: 'text', text: row.content || '' });
       const attachmentList = attachmentsByMessageId.get(row.id) || [];
+      // 如果有非图片附件，添加提示让模型知道这些是用户上传的文件
+      const hasDocAttachments = attachmentList.some(a => a.file_type === 'document' || a.file_type === 'text');
+      if (hasDocAttachments) {
+        parts.push({ type: 'text', text: '\n\n---\n以下是用户上传的文件内容（无需搜索，直接基于文件内容回答）：' });
+      }
       for (const attachment of attachmentList) {
-        const base64 = safeReadFileBase64(attachment.file_path);
-        if (!base64) continue;
-        parts.push({
-          type: 'image',
-          source: {
-            type: 'base64',
-            media_type: attachment.mime_type,
-            data: base64,
-          },
-        });
+        if (attachment.file_type === 'image') {
+          const base64 = safeReadFileBase64(attachment.file_path);
+          if (!base64) continue;
+          parts.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: attachment.mime_type,
+              data: base64,
+            },
+          });
+        } else if (attachment.file_type === 'document') {
+          // PDF → document block；Office 文档 → 解析为文本
+          if (needsParsing(attachment.file_path, attachment.mime_type)) {
+            try {
+              const result = await parseFile(attachment.file_path, attachment.mime_type);
+              const label = getFormatLabel(attachment.file_path);
+              parts.push({
+                type: 'text',
+                text: `[附件] 文件名：${attachment.file_name}（${label}）\n\n${result.text}`,
+              });
+            } catch (e) {
+              parts.push({
+                type: 'text',
+                text: `📄 文件：${attachment.file_name}（解析失败：${e.message}）`,
+              });
+            }
+          } else {
+            const base64 = safeReadFileBase64(attachment.file_path);
+            if (!base64) continue;
+            parts.push({
+              type: 'document',
+              source: {
+                type: 'base64',
+                media_type: attachment.mime_type,
+                data: base64,
+              },
+            });
+          }
+        } else if (attachment.file_type === 'text') {
+          try {
+            const textContent = fs.readFileSync(attachment.file_path, 'utf-8');
+            parts.push({
+              type: 'text',
+              text: `文件：${attachment.file_name}\n\`\`\`\n${textContent}\n\`\`\``,
+            });
+          } catch (e) {
+            // 文件读取失败，跳过
+          }
+        }
       }
 
       anthropicMessages.push({ role: row.role, content: parts });

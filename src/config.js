@@ -26,6 +26,27 @@ const COMPACTION_TRIGGER = Math.floor(MESSAGE_TOKEN_BUDGET * COMPACTION_THRESHOL
 const TOOL_EXECUTION_TIMEOUT = 30000;
 const TOOL_LOOP_MAX_ROUNDS = 10;
 
+// === 文件上传配置 ===
+const UPLOAD_MAX_FILE_SIZE = 30 * 1024 * 1024; // 30MB
+const UPLOAD_MAX_FILES_PER_MESSAGE = 5;
+const UPLOAD_ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
+const UPLOAD_ALLOWED_DOCUMENT_TYPES = [
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.oasis.opendocument.text',
+  'application/rtf',
+  'application/epub+zip',
+];
+const UPLOAD_ALLOWED_TEXT_EXTENSIONS = [
+  '.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml',
+  '.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.cpp', '.c', '.h', '.cs',
+  '.go', '.rs', '.rb', '.php', '.swift', '.kt', '.scala',
+  '.html', '.css', '.scss', '.less', '.sql', '.sh', '.bash',
+  '.vue', '.svelte', '.lua', '.r', '.m', '.pl', '.ex', '.exs',
+];
+
 if (!JWT_SECRET) {
   throw new Error('JWT_SECRET is required. Please set it in your .env file.');
 }
@@ -48,5 +69,10 @@ module.exports = {
   COMPACTION_TRIGGER,
   TOOL_EXECUTION_TIMEOUT,
   TOOL_LOOP_MAX_ROUNDS,
+  UPLOAD_MAX_FILE_SIZE,
+  UPLOAD_MAX_FILES_PER_MESSAGE,
+  UPLOAD_ALLOWED_IMAGE_TYPES,
+  UPLOAD_ALLOWED_DOCUMENT_TYPES,
+  UPLOAD_ALLOWED_TEXT_EXTENSIONS,
 };
 

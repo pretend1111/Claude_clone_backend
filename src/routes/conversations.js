@@ -116,7 +116,7 @@ router.get('/:id', (req, res, next) => {
       const attachments = db
         .prepare(
           `
-            SELECT rowid AS id, message_id, file_type, file_name, file_path, mime_type
+            SELECT id, message_id, file_type, file_name, file_path, mime_type
             FROM attachments
             WHERE message_id IN (${placeholders})
             ORDER BY created_at ASC

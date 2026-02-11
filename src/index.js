@@ -10,6 +10,7 @@ const authRoutes = require('./routes/auth');
 const conversationsRoutes = require('./routes/conversations');
 const chatRoutes = require('./routes/chat');
 const userRoutes = require('./routes/user');
+const uploadRoutes = require('./routes/upload');
 const auth = require('./middleware/auth');
 const { chatRateLimit, authRateLimit } = require('./middleware/rateLimit');
 
@@ -48,6 +49,8 @@ app.use('/api/auth', authRateLimit, authRoutes);
 app.use('/api/conversations', auth, conversationsRoutes);
 app.use('/api/chat', auth, chatRateLimit, chatRoutes);
 app.use('/api/user', auth, userRoutes);
+app.use('/api/upload', auth, uploadRoutes);
+app.use('/api/uploads', auth, uploadRoutes);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
