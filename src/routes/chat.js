@@ -363,6 +363,7 @@ router.post('/', async (req, res, next) => {
             stream: false,
             system: systemPrompt,
             messages: workingMessages,
+            thinking: { type: 'enabled', budget_tokens: config.THINKING_BUDGET_TOKENS },
           };
           if (includeTools) {
             reqBody.tools = toolDefinitions;
@@ -452,6 +453,7 @@ router.post('/', async (req, res, next) => {
           stream: true,
           system: systemPrompt,
           messages: workingMessages,
+          thinking: { type: 'enabled', budget_tokens: config.THINKING_BUDGET_TOKENS },
         };
         // 流式请求也带 tools（让服务端工具生效）
         if (hasTools) {
@@ -479,6 +481,8 @@ router.post('/', async (req, res, next) => {
           const reader = streamResponse.body.getReader();
           const decoder = new TextDecoder();
           let sseBuffer = '';
+          // 跟踪每个 content block 的类型，key=index
+          const blockTypeMap = {};
           try {
             while (true) {
               const { done, value } = await reader.read();
@@ -486,36 +490,45 @@ router.post('/', async (req, res, next) => {
               if (clientClosed) break;
 
               if (value) {
-                res.write(value);
-
                 sseBuffer += decoder.decode(value, { stream: true });
-                // 按完整行切分，保留不完整的最后一行
                 const parts = sseBuffer.split('\n');
                 sseBuffer = parts.pop() || '';
 
                 for (const line of parts) {
                   if (!line.startsWith('data: ')) continue;
                   const data = line.slice(6).trim();
-                  if (data === '[DONE]') continue;
+                  if (data === '[DONE]') {
+                    res.write(`data: [DONE]\n\n`);
+                    continue;
+                  }
+
+                  let parsed;
                   try {
-                    const parsed = JSON.parse(data);
-                    if (parsed.type === 'content_block_delta' && parsed.delta && parsed.delta.type === 'text_delta') {
-                      assistantMessage += parsed.delta.text;
-                    }
-                    if (parsed.type === 'message_delta' && parsed.usage) {
-                      totalInputTokens += parsed.usage.input_tokens || 0;
-                      totalOutputTokens += parsed.usage.output_tokens || 0;
-                    }
-                    // 服务端工具：检测 server_tool_use block 开始，发送搜索状态通知
-                    if (parsed.type === 'content_block_start' && parsed.content_block && parsed.content_block.type === 'server_tool_use') {
+                    parsed = JSON.parse(data);
+                  } catch (e) {
+                    continue;
+                  }
+
+                  // --- content_block_start：记录 block 类型，按类型分发 ---
+                  if (parsed.type === 'content_block_start' && parsed.content_block) {
+                    const idx = parsed.index;
+                    const blockType = parsed.content_block.type;
+                    blockTypeMap[idx] = blockType;
+
+                    if (blockType === 'thinking' || blockType === 'text') {
+                      // 透传给前端
+                      res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                    } else if (blockType === 'server_tool_use') {
+                      // 发送搜索状态通知（不透传原始事件）
                       const query = (parsed.content_block.input && parsed.content_block.input.query) || '';
-                      res.write(`data: ${JSON.stringify({
-                        type: 'status',
-                        message: `正在搜索：${query}`,
-                      })}\n\n`);
-                    }
-                    // 搜索结果：提取 citations 来源信息，发送给前端
-                    if (parsed.type === 'content_block_start' && parsed.content_block && parsed.content_block.type === 'web_search_tool_result') {
+                      if (query) {
+                        res.write(`data: ${JSON.stringify({
+                          type: 'status',
+                          message: `正在搜索：${query}`,
+                        })}\n\n`);
+                      }
+                    } else if (blockType === 'web_search_tool_result') {
+                      // 提取搜索来源（不透传原始事件）
                       const searchResults = parsed.content_block.content;
                       if (Array.isArray(searchResults)) {
                         const sources = searchResults
@@ -529,9 +542,53 @@ router.post('/', async (req, res, next) => {
                         }
                       }
                     }
-                  } catch (e) {
-                    // ignore parse error
+                    // 其他未知 block 类型：静默忽略
+                    continue;
                   }
+
+                  // --- content_block_delta：只转发 thinking/text block 的 delta ---
+                  if (parsed.type === 'content_block_delta') {
+                    const idx = parsed.index;
+                    const blockType = blockTypeMap[idx];
+
+                    if (blockType === 'thinking' || blockType === 'text') {
+                      res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                      // 累积助手文本
+                      if (parsed.delta && parsed.delta.type === 'text_delta') {
+                        assistantMessage += parsed.delta.text;
+                      }
+                    }
+                    // server_tool_use / web_search_tool_result 的 delta：静默忽略
+                    continue;
+                  }
+
+                  // --- content_block_stop：只转发 thinking/text block ---
+                  if (parsed.type === 'content_block_stop') {
+                    const idx = parsed.index;
+                    const blockType = blockTypeMap[idx];
+                    if (blockType === 'thinking' || blockType === 'text') {
+                      res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                    }
+                    continue;
+                  }
+
+                  // --- message_start / message_delta / message_stop：直接透传 ---
+                  if (parsed.type === 'message_start' || parsed.type === 'message_stop') {
+                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                    continue;
+                  }
+
+                  if (parsed.type === 'message_delta') {
+                    if (parsed.usage) {
+                      totalInputTokens += parsed.usage.input_tokens || 0;
+                      totalOutputTokens += parsed.usage.output_tokens || 0;
+                    }
+                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                    continue;
+                  }
+
+                  // --- ping / error 等其他事件：透传 ---
+                  res.write(`data: ${JSON.stringify(parsed)}\n\n`);
                 }
               }
             }
