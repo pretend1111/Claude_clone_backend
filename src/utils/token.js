@@ -3,7 +3,7 @@ const jwt = require('jsonwebtoken');
 const config = require('../config');
 
 function generateToken(userId) {
-  return jwt.sign({ userId }, config.JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign({ userId }, config.JWT_SECRET, { expiresIn: '30d' });
 }
 
 function verifyToken(token) {

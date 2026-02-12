@@ -21,6 +21,7 @@ function auth(req, res, next) {
     }
 
     req.userId = decoded.userId;
+    req.tokenExp = decoded.exp;
     return next();
   } catch (err) {
     return res.status(401).json({ error: '认证令牌无效或已过期' });

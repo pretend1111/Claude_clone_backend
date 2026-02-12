@@ -5,6 +5,8 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const API_BASE_URL = process.env.API_BASE_URL || '';
 const API_KEY = process.env.API_KEY || '';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
 
 // 系统提示词文件路径
 const SYSTEM_PROMPT_PATH = process.env.SYSTEM_PROMPT_PATH ||
@@ -59,6 +61,8 @@ module.exports = {
   JWT_SECRET,
   API_BASE_URL,
   API_KEY,
+  RESEND_API_KEY,
+  RESEND_FROM_EMAIL,
   SYSTEM_PROMPT_PATH,
   CONTEXT_WINDOW,
   MAX_OUTPUT_TOKENS,

@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 
 const { getDb } = require('../db/init');
+const { generateToken } = require('../utils/token');
 
 const router = express.Router();
 
@@ -38,7 +39,16 @@ router.get('/profile', (req, res, next) => {
       return res.status(404).json({ error: '用户不存在' });
     }
 
-    return res.json(user);
+    // Token 剩余不足 7 天时自动续期
+    const result = { ...user };
+    if (req.tokenExp) {
+      const remainingDays = (req.tokenExp * 1000 - Date.now()) / (1000 * 60 * 60 * 24);
+      if (remainingDays < 7) {
+        result.newToken = generateToken(req.userId);
+      }
+    }
+
+    return res.json(result);
   } catch (err) {
     return next(err);
   }

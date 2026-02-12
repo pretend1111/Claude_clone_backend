@@ -2,6 +2,7 @@ const config = require('./config');
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const fs = require('fs');
 const path = require('path');
 const { init: initDb } = require('./db/init');
@@ -33,6 +34,7 @@ const allowedOrigins = new Set([
   'http://127.0.0.1:3000',
 ]);
 
+app.use(helmet());
 app.use(
   cors({
     origin(origin, callback) {

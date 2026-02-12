@@ -119,6 +119,30 @@ function init() {
     console.log('[DB] Migrated attachments table: added id column, expanded file_type');
   }
 
+  // === 数据库迁移：verification_codes 表 ===
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS verification_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      code TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'register',
+      expires_at DATETIME NOT NULL,
+      used INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_verification_codes_email ON verification_codes(email);
+  `);
+
+  // === 数据库迁移：users 表增加 login_attempts / locked_until ===
+  const userColumns = db.pragma('table_info(users)');
+  const userColumnNames = new Set(userColumns.map(col => col.name));
+  if (!userColumnNames.has('login_attempts')) {
+    db.exec('ALTER TABLE users ADD COLUMN login_attempts INTEGER DEFAULT 0');
+  }
+  if (!userColumnNames.has('locked_until')) {
+    db.exec('ALTER TABLE users ADD COLUMN locked_until DATETIME');
+  }
+
   dbInstance = db;
   return dbInstance;
 }
