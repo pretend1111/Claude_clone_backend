@@ -308,7 +308,7 @@ router.post('/', async (req, res, next) => {
     let clientClosed = false;
 
     const url = `${config.API_BASE_URL}/v1/messages`;
-    const systemPrompt = getSystemPrompt();
+    const systemPrompt = getSystemPrompt(req.userId);
     const toolDefinitions = toolRegistry.getToolDefinitions();
     const hasTools = toolRegistry.hasTools();
     const hasLocalTools = toolRegistry.hasLocalTools();

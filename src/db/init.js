@@ -143,6 +143,26 @@ function init() {
     db.exec('ALTER TABLE users ADD COLUMN locked_until DATETIME');
   }
 
+  // === 数据库迁移：users 表增加 profile 字段 ===
+  if (!userColumnNames.has('full_name')) {
+    db.exec('ALTER TABLE users ADD COLUMN full_name TEXT');
+  }
+  if (!userColumnNames.has('display_name')) {
+    db.exec('ALTER TABLE users ADD COLUMN display_name TEXT');
+  }
+  if (!userColumnNames.has('work_function')) {
+    db.exec('ALTER TABLE users ADD COLUMN work_function TEXT');
+  }
+  if (!userColumnNames.has('personal_preferences')) {
+    db.exec('ALTER TABLE users ADD COLUMN personal_preferences TEXT');
+  }
+  if (!userColumnNames.has('theme')) {
+    db.exec("ALTER TABLE users ADD COLUMN theme TEXT DEFAULT 'light'");
+  }
+  if (!userColumnNames.has('chat_font')) {
+    db.exec("ALTER TABLE users ADD COLUMN chat_font TEXT DEFAULT 'default'");
+  }
+
   dbInstance = db;
   return dbInstance;
 }

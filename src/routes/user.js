@@ -20,15 +20,10 @@ router.get('/profile', (req, res, next) => {
       .prepare(
         `
           SELECT
-            id,
-            email,
-            nickname,
-            plan,
-            token_quota,
-            token_used,
-            storage_quota,
-            storage_used,
-            created_at
+            id, email, nickname, plan,
+            token_quota, token_used, storage_quota, storage_used,
+            full_name, display_name, work_function, personal_preferences,
+            theme, chat_font, created_at
           FROM users
           WHERE id = ?
         `
@@ -89,7 +84,7 @@ router.get('/usage', (req, res, next) => {
 });
 
 router.patch('/profile', (req, res, next) => {
-  const { nickname, password } = req.body || {};
+  const { nickname, password, full_name, display_name, work_function, personal_preferences, theme, chat_font } = req.body || {};
 
   const updates = [];
   const values = [];
@@ -106,6 +101,34 @@ router.patch('/profile', (req, res, next) => {
     const passwordHash = bcrypt.hashSync(password, 10);
     updates.push('password_hash = ?');
     values.push(passwordHash);
+  }
+
+  if (typeof full_name === 'string') {
+    updates.push('full_name = ?');
+    values.push(full_name);
+  }
+  if (typeof display_name === 'string') {
+    updates.push('display_name = ?');
+    values.push(display_name);
+  }
+  if (typeof work_function === 'string') {
+    updates.push('work_function = ?');
+    values.push(work_function);
+  }
+  if (typeof personal_preferences === 'string') {
+    if (personal_preferences.length > 2000) {
+      return res.status(400).json({ error: '偏好指令最多 2000 字符' });
+    }
+    updates.push('personal_preferences = ?');
+    values.push(personal_preferences);
+  }
+  if (typeof theme === 'string' && ['light', 'auto', 'dark'].includes(theme)) {
+    updates.push('theme = ?');
+    values.push(theme);
+  }
+  if (typeof chat_font === 'string' && ['default', 'sans', 'system', 'dyslexic'].includes(chat_font)) {
+    updates.push('chat_font = ?');
+    values.push(chat_font);
   }
 
   if (updates.length === 0) {
@@ -126,15 +149,10 @@ router.patch('/profile', (req, res, next) => {
       .prepare(
         `
           SELECT
-            id,
-            email,
-            nickname,
-            plan,
-            token_quota,
-            token_used,
-            storage_quota,
-            storage_used,
-            created_at
+            id, email, nickname, plan,
+            token_quota, token_used, storage_quota, storage_used,
+            full_name, display_name, work_function, personal_preferences,
+            theme, chat_font, created_at
           FROM users
           WHERE id = ?
         `
