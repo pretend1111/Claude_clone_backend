@@ -133,8 +133,26 @@ router.post('/', async (req, res, next) => {
       return res.status(401).json({ error: '用户不存在' });
     }
 
-    if (Number(user.token_used) >= Number(user.token_quota)) {
-      return res.status(429).json({ error: '配额已用完' });
+    // 检查订阅额度（优先）或用户基础额度
+    // 先标记过期订阅
+    db.prepare(
+      "UPDATE user_subscriptions SET status = 'expired' WHERE user_id = ? AND status = 'active' AND expires_at <= datetime('now')"
+    ).run(req.userId);
+
+    const activeSub = db.prepare(
+      "SELECT * FROM user_subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') AND starts_at <= datetime('now') ORDER BY created_at ASC LIMIT 1"
+    ).get(req.userId);
+
+    if (activeSub) {
+      // 有活跃订阅，检查订阅额度
+      if (activeSub.tokens_used >= activeSub.token_quota) {
+        return res.status(403).json({ error: '套餐额度已用完，请升级套餐' });
+      }
+    } else {
+      // 无活跃订阅，使用用户基础额度
+      if (Number(user.token_used) >= Number(user.token_quota)) {
+        return res.status(403).json({ error: '额度已用完，请购买套餐' });
+      }
     }
 
     const normalizedAttachments = Array.isArray(attachments) ? attachments : [];
@@ -612,6 +630,19 @@ router.post('/', async (req, res, next) => {
           if (usageData) {
             contextManager.saveTokenUsage(msgId, messageId, usageData);
             contextManager.updateUserTokenUsage(req.userId, usageData.input_tokens || 0, usageData.output_tokens || 0);
+
+            // 累加订阅额度使用量
+            const totalTokens = (usageData.input_tokens || 0) + (usageData.output_tokens || 0);
+            if (totalTokens > 0) {
+              const currentSub = db.prepare(
+                "SELECT id FROM user_subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') AND starts_at <= datetime('now') ORDER BY created_at ASC LIMIT 1"
+              ).get(req.userId);
+              if (currentSub) {
+                db.prepare(
+                  'UPDATE user_subscriptions SET tokens_used = tokens_used + ? WHERE id = ?'
+                ).run(totalTokens, currentSub.id);
+              }
+            }
           }
 
           db.prepare('UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(conversationId);

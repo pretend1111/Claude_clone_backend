@@ -60,15 +60,48 @@ router.get('/usage', (req, res, next) => {
       return res.status(404).json({ error: '用户不存在' });
     }
 
-    const tokenQuota = Number(user.token_quota) || 0;
-    const tokenUsed = Number(user.token_used) || 0;
-    const storageQuota = Number(user.storage_quota) || 0;
+    // 标记过期订阅
+    db.prepare(
+      "UPDATE user_subscriptions SET status = 'expired' WHERE user_id = ? AND status = 'active' AND expires_at <= datetime('now')"
+    ).run(req.userId);
+
+    // 查询活跃订阅
+    const activeSub = db.prepare(
+      "SELECT s.*, p.name as plan_name, p.storage_quota as plan_storage_quota FROM user_subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.expires_at > datetime('now') ORDER BY s.created_at ASC LIMIT 1"
+    ).get(req.userId);
+
+    // 消息统计
+    const todayMessages = db.prepare(
+      "SELECT COUNT(*) as count FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE c.user_id = ? AND m.role = 'user' AND m.created_at >= date('now')"
+    ).get(req.userId);
+    const monthMessages = db.prepare(
+      "SELECT COUNT(*) as count FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE c.user_id = ? AND m.role = 'user' AND m.created_at >= date('now', 'start of month')"
+    ).get(req.userId);
+
+    // 决定显示的额度（订阅优先）
+    let tokenQuota, tokenUsed;
+    if (activeSub) {
+      tokenQuota = Number(activeSub.token_quota) || 0;
+      tokenUsed = Number(activeSub.tokens_used) || 0;
+    } else {
+      tokenQuota = Number(user.token_quota) || 0;
+      tokenUsed = Number(user.token_used) || 0;
+    }
+
+    const storageQuota = activeSub && activeSub.plan_storage_quota
+      ? Math.max(Number(user.storage_quota) || 0, Number(activeSub.plan_storage_quota))
+      : Number(user.storage_quota) || 0;
     const storageUsed = Number(user.storage_used) || 0;
 
     const tokenRemaining = tokenQuota - tokenUsed;
     const storageRemaining = storageQuota - storageUsed;
 
     return res.json({
+      plan: activeSub ? {
+        name: activeSub.plan_name,
+        expires_at: activeSub.expires_at,
+        status: 'active',
+      } : null,
       token_quota: tokenQuota,
       token_used: tokenUsed,
       token_remaining: tokenRemaining,
@@ -77,6 +110,10 @@ router.get('/usage', (req, res, next) => {
       storage_used: storageUsed,
       storage_remaining: storageRemaining,
       storage_percent: toPercent(storageUsed, storageQuota),
+      messages: {
+        today: todayMessages?.count || 0,
+        month: monthMessages?.count || 0,
+      },
     });
   } catch (err) {
     return next(err);

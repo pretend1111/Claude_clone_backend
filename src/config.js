@@ -7,6 +7,10 @@ const API_BASE_URL = process.env.API_BASE_URL || '';
 const API_KEY = process.env.API_KEY || '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+const PAYMENT_APP_ID = process.env.PAYMENT_APP_ID || '';
+const PAYMENT_APP_SECRET = process.env.PAYMENT_APP_SECRET || '';
+const PAYMENT_CALLBACK_URL = process.env.PAYMENT_CALLBACK_URL || '';
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 
 // 系统提示词文件路径
 const SYSTEM_PROMPT_PATH = process.env.SYSTEM_PROMPT_PATH ||
@@ -63,6 +67,10 @@ module.exports = {
   API_KEY,
   RESEND_API_KEY,
   RESEND_FROM_EMAIL,
+  PAYMENT_APP_ID,
+  PAYMENT_APP_SECRET,
+  PAYMENT_CALLBACK_URL,
+  ADMIN_API_KEY,
   SYSTEM_PROMPT_PATH,
   CONTEXT_WINDOW,
   MAX_OUTPUT_TOKENS,

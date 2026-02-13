@@ -45,8 +45,26 @@ const authRateLimit = createRateLimiter({
   },
 });
 
+const redeemRateLimit = createRateLimiter({
+  type: 'redeem',
+  limit: 10,
+  getIdentifier(req) {
+    return req.userId || req.ip || 'unknown';
+  },
+});
+
+const adminRateLimit = createRateLimiter({
+  type: 'admin',
+  limit: 20,
+  getIdentifier(req) {
+    return req.ip || 'unknown';
+  },
+});
+
 module.exports = {
   chatRateLimit,
   authRateLimit,
+  redeemRateLimit,
+  adminRateLimit,
 };
 

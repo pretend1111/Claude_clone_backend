@@ -12,6 +12,9 @@ const conversationsRoutes = require('./routes/conversations');
 const chatRoutes = require('./routes/chat');
 const userRoutes = require('./routes/user');
 const uploadRoutes = require('./routes/upload');
+const paymentRoutes = require('./routes/payment');
+const redemptionRoutes = require('./routes/redemption');
+const adminRoutes = require('./routes/admin');
 const auth = require('./middleware/auth');
 const { chatRateLimit, authRateLimit } = require('./middleware/rateLimit');
 
@@ -53,6 +56,9 @@ app.use('/api/chat', auth, chatRateLimit, chatRoutes);
 app.use('/api/user', auth, userRoutes);
 app.use('/api/upload', auth, uploadRoutes);
 app.use('/api/uploads', auth, uploadRoutes);
+app.use('/api/payment', paymentRoutes);
+app.use('/api/redemption', redemptionRoutes);
+app.use('/api/admin', adminRoutes);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
