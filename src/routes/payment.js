@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const { getDb } = require('../db/init');
 const payment = require('../lib/payment');
 const auth = require('../middleware/auth');
+const { paymentCreateRateLimit } = require('../middleware/rateLimit');
 
 const router = express.Router();
 
@@ -19,7 +20,7 @@ router.get('/plans', (req, res, next) => {
 });
 
 // POST /api/payment/create — 创建订单（需登录）
-router.post('/create', auth, (req, res, next) => {
+router.post('/create', auth, paymentCreateRateLimit, (req, res, next) => {
   const { plan_id, payment_method } = req.body || {};
 
   if (!plan_id || !payment_method) {

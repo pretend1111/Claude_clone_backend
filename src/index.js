@@ -16,7 +16,7 @@ const paymentRoutes = require('./routes/payment');
 const redemptionRoutes = require('./routes/redemption');
 const adminRoutes = require('./routes/admin');
 const auth = require('./middleware/auth');
-const { chatRateLimit, authRateLimit } = require('./middleware/rateLimit');
+const { chatRateLimit, loginRateLimit, registerRateLimit, sendCodeRateLimit, paymentCreateRateLimit } = require('./middleware/rateLimit');
 
 const app = express();
 const port = config.PORT;
@@ -50,7 +50,7 @@ app.use(
 
 app.use(express.json({ limit: '2mb' }));
 
-app.use('/api/auth', authRateLimit, authRoutes);
+app.use('/api/auth', authRoutes);
 app.use('/api/conversations', auth, conversationsRoutes);
 app.use('/api/chat', auth, chatRateLimit, chatRoutes);
 app.use('/api/user', auth, userRoutes);

@@ -6,6 +6,7 @@ const { Resend } = require('resend');
 const config = require('../config');
 const { getDb } = require('../db/init');
 const { generateToken } = require('../utils/token');
+const { loginRateLimit, registerRateLimit, sendCodeRateLimit } = require('../middleware/rateLimit');
 
 const router = express.Router();
 const resend = new Resend(config.RESEND_API_KEY);
@@ -34,7 +35,7 @@ async function sendVerificationEmail(email, code, type) {
 }
 
 // === 发送注册验证码 ===
-router.post('/send-code', async (req, res) => {
+router.post('/send-code', sendCodeRateLimit, async (req, res) => {
   const { email } = req.body || {};
 
   if (typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
@@ -74,7 +75,7 @@ router.post('/send-code', async (req, res) => {
 });
 
 // === 注册（需要验证码） ===
-router.post('/register', (req, res) => {
+router.post('/register', registerRateLimit, (req, res) => {
   const { email, password, nickname, code } = req.body || {};
 
   if (typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
@@ -128,7 +129,7 @@ router.post('/register', (req, res) => {
 });
 
 // === 登录（含失败锁定） ===
-router.post('/login', (req, res) => {
+router.post('/login', loginRateLimit, (req, res) => {
   const { email, password } = req.body || {};
 
   if (typeof email !== 'string' || typeof password !== 'string') {
@@ -177,7 +178,7 @@ router.post('/login', (req, res) => {
 });
 
 // === 忘记密码：发送重置验证码 ===
-router.post('/forgot-password', async (req, res) => {
+router.post('/forgot-password', sendCodeRateLimit, async (req, res) => {
   const { email } = req.body || {};
 
   if (typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
@@ -217,7 +218,7 @@ router.post('/forgot-password', async (req, res) => {
 });
 
 // === 重置密码 ===
-router.post('/reset-password', (req, res) => {
+router.post('/reset-password', loginRateLimit, (req, res) => {
   const { email, code, password } = req.body || {};
 
   if (typeof email !== 'string' || !EMAIL_REGEX.test(email)) {

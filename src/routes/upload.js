@@ -75,8 +75,16 @@ router.post('/', upload.single('file'), (req, res, next) => {
       return res.status(401).json({ error: '用户不存在' });
     }
 
+    // 检查活跃订阅的套餐配额，取较大值
+    const activeSub = db.prepare(
+      "SELECT p.storage_quota as plan_storage_quota FROM user_subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.expires_at > datetime('now') ORDER BY s.created_at ASC LIMIT 1"
+    ).get(req.userId);
+
     const currentUsed = Number(user.storage_used) || 0;
-    const quota = Number(user.storage_quota) || 0;
+    const baseQuota = Number(user.storage_quota) || 0;
+    const quota = activeSub && activeSub.plan_storage_quota
+      ? Math.max(baseQuota, Number(activeSub.plan_storage_quota))
+      : baseQuota;
     if (currentUsed + size > quota) {
       return res.status(413).json({ error: '存储空间不足' });
     }
@@ -141,6 +149,47 @@ router.get('/:fileId/raw', (req, res, next) => {
     const stream = fs.createReadStream(attachment.file_path);
     stream.pipe(res);
     return undefined;
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// DELETE /:fileId — 删除未发送的附件，释放存储空间
+router.delete('/:fileId', (req, res, next) => {
+  try {
+    const { fileId } = req.params;
+    const db = getDb();
+
+    const attachment = db
+      .prepare("SELECT id, file_path, file_size, user_id, message_id FROM attachments WHERE id = ?")
+      .get(fileId);
+
+    if (!attachment) {
+      return res.status(404).json({ error: '文件不存在' });
+    }
+    if (attachment.user_id !== req.userId) {
+      return res.status(403).json({ error: '无权操作' });
+    }
+    // 只允许删除未关联消息的附件（message_id 为空字符串）
+    if (attachment.message_id && attachment.message_id !== '') {
+      return res.status(400).json({ error: '已发送的附件不可删除' });
+    }
+
+    // 删除磁盘文件
+    if (fs.existsSync(attachment.file_path)) {
+      fs.unlinkSync(attachment.file_path);
+    }
+
+    // 删除数据库记录
+    db.prepare('DELETE FROM attachments WHERE id = ?').run(fileId);
+
+    // 释放存储空间
+    const size = Number(attachment.file_size) || 0;
+    db.prepare(
+      'UPDATE users SET storage_used = CASE WHEN storage_used - ? < 0 THEN 0 ELSE storage_used - ? END, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+    ).run(size, size, req.userId);
+
+    return res.json({ success: true });
   } catch (err) {
     return next(err);
   }
