@@ -15,6 +15,7 @@ const uploadRoutes = require('./routes/upload');
 const paymentRoutes = require('./routes/payment');
 const redemptionRoutes = require('./routes/redemption');
 const adminRoutes = require('./routes/admin');
+const documentsRoutes = require('./routes/documents');
 const auth = require('./middleware/auth');
 const { chatRateLimit, loginRateLimit, registerRateLimit, sendCodeRateLimit, paymentCreateRateLimit } = require('./middleware/rateLimit');
 
@@ -23,18 +24,26 @@ const port = config.PORT;
 
 const dataDir = path.join(__dirname, '..', 'data');
 const uploadsDir = path.join(dataDir, 'uploads');
+const documentsDir = path.join(dataDir, 'documents');
 
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadsDir, { recursive: true });
+fs.mkdirSync(documentsDir, { recursive: true });
 
 initDb();
 loadSystemPrompt(); // 启动时加载系统提示词到内存
+
+// 初始化密钥池
+const keyPool = require('./lib/keyPool');
+keyPool.init();
 
 const allowedOrigins = new Set([
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
+  'https://jiazhuang',        // 加这个
+  'https://jiazhuang:20080', // 如果前端也有端口
 ]);
 
 app.use(helmet());
@@ -59,6 +68,7 @@ app.use('/api/uploads', auth, uploadRoutes);
 app.use('/api/payment', paymentRoutes);
 app.use('/api/redemption', redemptionRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/documents', auth, documentsRoutes);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });

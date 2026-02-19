@@ -9,11 +9,14 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
  *   node scripts/auto-deliver.js --plan 3 --count 1 --note "闲鱼订单12345"
  *
  * 环境变量（或在下方常量中配置）：
- *   API_URL      — 后端地址，默认 http://localhost:3001
+ *   API_URL      — 后端地址；未设置时会使用 http://localhost:${PORT}（默认端口 3001）
  *   ADMIN_API_KEY — 管理员密钥
  */
 
-const API_URL = process.env.API_URL || 'http://localhost:3001';
+// Prefer explicit API_URL; otherwise follow PORT from .env so it works on servers
+// where the backend doesn't run on 3001 (e.g. PORT=20080).
+const DEFAULT_PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
+const API_URL = (process.env.API_URL || ('http://localhost:' + DEFAULT_PORT)).replace(/\/+$|\/+$/, '');
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 
 function parseArgs() {

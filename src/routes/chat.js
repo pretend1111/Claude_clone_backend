@@ -7,10 +7,127 @@ const config = require('../config');
 const { getDb } = require('../db/init');
 const { getSystemPrompt } = require('../lib/systemPrompt');
 const contextManager = require('../lib/contextManager');
+const keyPool = require('../lib/keyPool');
+const billing = require('../lib/billing');
+const quotaEngine = require('../lib/quotaEngine');
 const { registry: toolRegistry, executor: toolExecutor } = require('../tools');
 const { parseFile, needsParsing, getFormatLabel } = require('../tools/file-parsers');
 
 const router = express.Router();
+
+/**
+ * 流式请求一轮：实时转发 thinking 事件给前端（spinning logo），
+ * 缓冲 text 事件，累积 tool_use，返回完整消息对象。
+ * 兼容中转 API（即使 stream:true 也能正常工作）。
+ */
+async function streamToolRound(res, fetchUrl, fetchHeaders, reqBody, controller, isClientClosed, emitMessageStart) {
+  const bodyStr = JSON.stringify({ ...reqBody, stream: true });
+  console.log(`[Chat] streamToolRound: url=${fetchUrl}, bodySize=${Math.round(bodyStr.length/1024)}KB, model=${reqBody.model}`);
+  const response = await fetch(fetchUrl, {
+    method: 'POST',
+    headers: fetchHeaders,
+    body: bodyStr,
+    signal: controller.signal,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error(`[Chat] upstream error: status=${response.status}, body=${errText.substring(0, 300)}`);
+    return { ok: false, status: response.status, errorText: errText };
+  }
+
+  const message = { id: '', model: '', role: 'assistant', content: [], stop_reason: null, usage: {} };
+  const inputAccumulators = {};
+  const blockTypeMap = {};
+  let messageDeltaEvent = null;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let sseBuffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done || isClientClosed()) break;
+
+      sseBuffer += decoder.decode(value, { stream: true });
+      const lines = sseBuffer.split('\n');
+      sseBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+
+        let parsed;
+        try { parsed = JSON.parse(data); } catch { continue; }
+
+        if (parsed.type === 'message_start' && parsed.message) {
+          message.id = parsed.message.id || '';
+          message.model = parsed.message.model || '';
+          if (parsed.message.usage) Object.assign(message.usage, parsed.message.usage);
+          if (emitMessageStart) res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+          continue;
+        }
+
+        if (parsed.type === 'content_block_start' && parsed.content_block) {
+          const idx = parsed.index;
+          const block = { ...parsed.content_block };
+          const bt = block.type;
+          blockTypeMap[idx] = bt;
+          if (bt === 'tool_use') { block.input = {}; inputAccumulators[idx] = ''; }
+          if (bt === 'thinking') block.thinking = '';
+          if (bt === 'text') block.text = '';
+          message.content[idx] = block;
+          // 实时转发 thinking 和 text
+          if (bt === 'thinking' || bt === 'text') res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+          continue;
+        }
+
+        if (parsed.type === 'content_block_delta' && parsed.delta) {
+          const idx = parsed.index;
+          const block = message.content[idx];
+          if (!block) continue;
+          const bt = blockTypeMap[idx];
+          if (parsed.delta.type === 'thinking_delta') {
+            block.thinking = (block.thinking || '') + (parsed.delta.thinking || '');
+          } else if (parsed.delta.type === 'text_delta') {
+            block.text = (block.text || '') + (parsed.delta.text || '');
+          } else if (parsed.delta.type === 'input_json_delta') {
+            inputAccumulators[idx] = (inputAccumulators[idx] || '') + (parsed.delta.partial_json || '');
+          }
+          if (bt === 'thinking' || bt === 'text') res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+          continue;
+        }
+
+        if (parsed.type === 'content_block_stop') {
+          const idx = parsed.index;
+          const bt = blockTypeMap[idx];
+          if (bt === 'thinking' || bt === 'text') res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+          continue;
+        }
+
+        if (parsed.type === 'message_delta' && parsed.delta) {
+          if (parsed.delta.stop_reason) message.stop_reason = parsed.delta.stop_reason;
+          if (parsed.usage) Object.assign(message.usage, parsed.usage);
+          messageDeltaEvent = parsed;
+          continue;
+        }
+        // message_stop, ping 等忽略
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  for (const [idx, jsonStr] of Object.entries(inputAccumulators)) {
+    if (jsonStr && message.content[idx]) {
+      try { message.content[idx].input = JSON.parse(jsonStr); } catch { message.content[idx].input = {}; }
+    }
+  }
+  message.content = message.content.filter(Boolean);
+  return { ok: true, message, messageDeltaEvent };
+}
 
 function getExtFromMediaType(mediaType, fileName) {
   const map = {
@@ -48,13 +165,17 @@ function safeReadFileBase64(filePath) {
 }
 
 async function generateTitle(conversationId, userMsg, assistantMsg) {
+  let poolKey = null;
   try {
-    const url = `${config.API_BASE_URL}/v1/messages`;
+    poolKey = keyPool.acquire();
+    const apiKey = poolKey ? poolKey.api_key : config.API_KEY;
+    const baseUrl = poolKey ? poolKey.base_url : config.API_BASE_URL;
+    const url = `${baseUrl}/v1/messages`;
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-api-key': config.API_KEY,
+        'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
@@ -89,15 +210,20 @@ async function generateTitle(conversationId, userMsg, assistantMsg) {
         const db = getDb();
         db.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(title, conversationId);
         console.log(`[Title] Generated for ${conversationId}: ${title}`);
+        if (poolKey) keyPool.recordSuccess(poolKey.id, 0, 0);
       } else {
         console.error('[Title] No text content in response:', JSON.stringify(data).substring(0, 500));
       }
     } else {
       const errorText = await response.text();
       console.error('[Title] API error:', response.status, errorText);
+      if (poolKey) keyPool.recordError(poolKey.id, `Title API ${response.status}`);
     }
   } catch (err) {
     console.error('Failed to generate title:', err);
+    if (poolKey) keyPool.recordError(poolKey.id, err.message);
+  } finally {
+    if (poolKey) keyPool.release(poolKey.id);
   }
 }
 
@@ -133,26 +259,10 @@ router.post('/', async (req, res, next) => {
       return res.status(401).json({ error: '用户不存在' });
     }
 
-    // 检查订阅额度（优先）或用户基础额度
-    // 先标记过期订阅
-    db.prepare(
-      "UPDATE user_subscriptions SET status = 'expired' WHERE user_id = ? AND status = 'active' AND expires_at <= datetime('now')"
-    ).run(req.userId);
-
-    const activeSub = db.prepare(
-      "SELECT * FROM user_subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') AND starts_at <= datetime('now') ORDER BY created_at ASC LIMIT 1"
-    ).get(req.userId);
-
-    if (activeSub) {
-      // 有活跃订阅，检查订阅额度
-      if (activeSub.tokens_used >= activeSub.token_quota) {
-        return res.status(403).json({ error: '套餐额度已用完，请升级套餐' });
-      }
-    } else {
-      // 无活跃订阅，使用用户基础额度
-      if (Number(user.token_used) >= Number(user.token_quota)) {
-        return res.status(403).json({ error: '额度已用完，请购买套餐' });
-      }
+    // 三层额度检查（总额度 + 窗口 + 周预算）
+    const quotaCheck = quotaEngine.checkQuota(req.userId);
+    if (!quotaCheck.allowed) {
+      return res.status(403).json({ error: quotaCheck.message, code: quotaCheck.reason, quota: quotaCheck.quota });
     }
 
     const normalizedAttachments = Array.isArray(attachments) ? attachments : [];
@@ -255,7 +365,9 @@ router.post('/', async (req, res, next) => {
       }
 
       const parts = [];
-      parts.push({ type: 'text', text: row.content || '' });
+      if (row.content && row.content.trim()) {
+        parts.push({ type: 'text', text: row.content });
+      }
       const attachmentList = attachmentsByMessageId.get(row.id) || [];
       // 如果有非图片附件，添加提示让模型知道这些是用户上传的文件
       const hasDocAttachments = attachmentList.some(a => a.file_type === 'document' || a.file_type === 'text');
@@ -265,7 +377,8 @@ router.post('/', async (req, res, next) => {
       for (const attachment of attachmentList) {
         if (attachment.file_type === 'image') {
           const base64 = safeReadFileBase64(attachment.file_path);
-          if (!base64) continue;
+          if (!base64) { console.warn(`[Chat] 图片读取失败: ${attachment.file_path}`); continue; }
+          console.log(`[Chat] 图片附件: ${attachment.file_name}, base64=${Math.round(base64.length/1024)}KB, mime=${attachment.mime_type}`);
           parts.push({
             type: 'image',
             source: {
@@ -315,24 +428,88 @@ router.post('/', async (req, res, next) => {
         }
       }
 
+      // 确保 content 数组中至少有一个 text block（部分中转 API 要求）
+      const hasText = parts.some(p => p.type === 'text');
+      if (!hasText && parts.length > 0) {
+        parts.push({ type: 'text', text: '请描述或分析上面的内容。' });
+      }
+
       anthropicMessages.push({ role: row.role, content: parts });
     }
 
     const prunedMessages = contextManager.pruneMessages(anthropicMessages);
+
+    // === 图片压缩：中转 API 请求体不能超过约 10MB ===
+    const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8MB base64 上限
+    let totalImageBytes = 0;
+    const allImageRefs = []; // { msg, partIndex, data_length }
+    for (const msg of prunedMessages) {
+      if (!Array.isArray(msg.content)) continue;
+      for (let i = 0; i < msg.content.length; i++) {
+        const part = msg.content[i];
+        if (part.type === 'image' && part.source && part.source.data) {
+          totalImageBytes += part.source.data.length;
+          allImageRefs.push({ msg, partIndex: i, data_length: part.source.data.length });
+        }
+      }
+    }
+    if (totalImageBytes > MAX_IMAGE_BYTES && allImageRefs.length > 0) {
+      console.log(`[Chat] 图片总大小 ${Math.round(totalImageBytes/1024)}KB 超限，压缩 ${allImageRefs.length} 张图片...`);
+      try {
+        const images = allImageRefs.map(ref => {
+          const part = ref.msg.content[ref.partIndex];
+          return { data: part.source.data, media_type: part.source.media_type };
+        });
+        const input = JSON.stringify({ images, max_total_bytes: MAX_IMAGE_BYTES });
+        const { execFileSync } = require('child_process');
+        const output = execFileSync('python3.11', [
+          path.join(__dirname, '..', '..', 'scripts', 'compress_images.py')
+        ], { input, maxBuffer: 50 * 1024 * 1024, timeout: 30000 });
+        const result = JSON.parse(output);
+        // 回写压缩后的数据
+        for (let i = 0; i < allImageRefs.length; i++) {
+          const ref = allImageRefs[i];
+          const compressed = result.images[i];
+          ref.msg.content[ref.partIndex].source.data = compressed.data;
+          ref.msg.content[ref.partIndex].source.media_type = compressed.media_type;
+        }
+        const newTotal = result.images.reduce((s, img) => s + img.data.length, 0);
+        console.log(`[Chat] 图片压缩完成: ${Math.round(totalImageBytes/1024)}KB -> ${Math.round(newTotal/1024)}KB`);
+      } catch (err) {
+        console.error('[Chat] 图片压缩失败，回退到移除策略:', err.message);
+        // 回退：从最早的消息移除图片
+        for (const msg of prunedMessages) {
+          if (totalImageBytes <= MAX_IMAGE_BYTES) break;
+          if (!Array.isArray(msg.content)) continue;
+          msg.content = msg.content.filter(part => {
+            if (part.type === 'image' && part.source && part.source.data && totalImageBytes > MAX_IMAGE_BYTES) {
+              totalImageBytes -= part.source.data.length;
+              return false;
+            }
+            return true;
+          });
+        }
+      }
+    }
 
     // === 步骤 A：初始化 ===
     const model = conversation.model || 'claude-opus-4-6-thinking';
     const controller = new AbortController();
     let clientClosed = false;
 
-    const url = `${config.API_BASE_URL}/v1/messages`;
-    const systemPrompt = getSystemPrompt(req.userId);
+    // 从密钥池获取密钥，池为空时回退到 config
+    const poolKey = keyPool.acquire(conversationId);
+    const activeApiKey = poolKey ? poolKey.api_key : config.API_KEY;
+    const activeBaseUrl = poolKey ? poolKey.base_url : config.API_BASE_URL;
+    const url = `${activeBaseUrl}/v1/messages`;
+    const systemPrompt = getSystemPrompt(req.userId, model);
     const toolDefinitions = toolRegistry.getToolDefinitions();
     const hasTools = toolRegistry.hasTools();
-    const hasLocalTools = toolRegistry.hasLocalTools();
     const workingMessages = [...prunedMessages];
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
+    let totalCacheCreationTokens = 0;
+    let totalCacheReadTokens = 0;
 
     // === 步骤 B：设置 SSE 响应头 ===
     res.status(200);
@@ -359,17 +536,21 @@ router.post('/', async (req, res, next) => {
 
     let assistantMessage = '';
     let usageData = null;
+    let createdDocument = null;
 
     try {
-      // === 步骤 C：判断走流式还是工具循环 ===
+      // === 步骤 C：流式工具循环 ===
       const maxRounds = config.TOOL_LOOP_MAX_ROUNDS || 10;
       let loopRound = 0;
-      let needStreamFinal = false;
-      // 没有本地工具时跳过非流式工具循环，直接走流式（服务端工具在流式中也能工作）
-      const skipToolLoop = !hasLocalTools;
 
-      if (!skipToolLoop) {
-        // === 本地工具循环（非流式）===
+      {
+        // === 流式工具循环（实时转发 thinking，缓冲 text）===
+        const fetchHeaders = {
+          'content-type': 'application/json',
+          'x-api-key': activeApiKey,
+          'anthropic-version': '2023-06-01',
+        };
+
         while (loopRound < maxRounds) {
           loopRound++;
           if (clientClosed) break;
@@ -378,270 +559,161 @@ router.post('/', async (req, res, next) => {
           const reqBody = {
             model,
             max_tokens: config.MAX_OUTPUT_TOKENS,
-            stream: false,
             system: systemPrompt,
             messages: workingMessages,
             thinking: { type: 'enabled', budget_tokens: config.THINKING_BUDGET_TOKENS },
           };
-          if (includeTools) {
-            reqBody.tools = toolDefinitions;
-          }
+          if (includeTools) reqBody.tools = toolDefinitions;
 
           console.log(`[Chat] 工具循环第 ${loopRound} 轮, includeTools=${includeTools}`);
 
-          const loopResponse = await fetch(url, {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              'x-api-key': config.API_KEY,
-              'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify(reqBody),
-            signal: controller.signal,
-          });
+          // 带重试的流式请求（502/503 等临时错误自动重试）
+          const RETRYABLE_LOOP = new Set([429, 500, 502, 503, 522, 524]);
+          let roundResult = null;
 
-          if (!loopResponse.ok) {
-            const errorText = await loopResponse.text();
-            console.error(`[Chat] 上游非流式请求失败:`, loopResponse.status, errorText);
-            res.write(`data: ${JSON.stringify({ type: 'error', error: '上游接口错误', detail: errorText })}\n\n`);
+          for (let attempt = 0; attempt <= 4; attempt++) {
+            if (clientClosed) break;
+            if (attempt > 0) {
+              const delay = Math.min(2000 * attempt, 8000);
+              await new Promise(r => setTimeout(r, delay));
+              console.log(`[Chat] 重试 ${attempt}/4, 等待 ${delay}ms`);
+            }
+            roundResult = await streamToolRound(
+              res, url, fetchHeaders, reqBody, controller,
+              () => clientClosed, loopRound === 1
+            );
+            if (roundResult.ok) break;
+            console.error(`[Chat] 请求失败 (attempt ${attempt + 1}):`, roundResult.status, (roundResult.errorText || '').substring(0, 200));
+            if (!RETRYABLE_LOOP.has(roundResult.status)) break;
+          }
+
+          if (!roundResult || !roundResult.ok) {
+            if (poolKey && roundResult && roundResult.status !== 400) keyPool.recordError(poolKey.id, `upstream ${roundResult.status}`);
+            res.write(`data: ${JSON.stringify({ type: 'error', error: '上游接口错误', detail: roundResult ? roundResult.errorText : '' })}\n\n`);
             break;
           }
 
-          const apiResult = await loopResponse.json();
-
+          const apiResult = roundResult.message;
           if (apiResult.usage) {
             totalInputTokens += apiResult.usage.input_tokens || 0;
             totalOutputTokens += apiResult.usage.output_tokens || 0;
+            totalCacheCreationTokens += apiResult.usage.cache_creation_input_tokens || 0;
+            totalCacheReadTokens += apiResult.usage.cache_read_input_tokens || 0;
           }
 
           const stopReason = apiResult.stop_reason;
           const contentBlocks = apiResult.content || [];
 
-          if (stopReason === 'tool_use') {
-            // 只处理本地 tool_use，不处理 server_tool_use
-            const toolUseBlocks = contentBlocks.filter((b) => b.type === 'tool_use');
-            const toolNames = toolUseBlocks.map((b) => b.name);
-            console.log(`[Chat] 模型请求工具调用: ${toolNames.join(', ')}`);
+          // 流被中转/上游提前断开（stop_reason 未收到）或 max_tokens 截断
+          if (!stopReason || stopReason === 'max_tokens') {
+            console.warn(`[Chat] 异常停止: stop_reason=${stopReason}, contentBlocks=${contentBlocks.length}`);
+            // 尽量把已有内容刷给前端（text 已实时转发）
+            if (roundResult.messageDeltaEvent) {
+              res.write(`data: ${JSON.stringify(roundResult.messageDeltaEvent)}\n\n`);
+            }
+            const reason = !stopReason
+              ? '上游连接中断（可能是中转 API 超时），模型思考时间过长导致连接被断开。建议缩短问题复杂度或拆分问题。'
+              : '模型输出达到 token 上限，回答被截断。';
+            res.write(`data: ${JSON.stringify({ type: 'error', error: reason })}\n\n`);
+            // 仍然收集已有文本
+            for (const block of contentBlocks) {
+              if (block.type === 'text') {
+                assistantMessage += block.text.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
+              }
+            }
+            usageData = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens, cache_creation_tokens: totalCacheCreationTokens, cache_read_tokens: totalCacheReadTokens };
+            break;
+          }
 
-            res.write(`data: ${JSON.stringify({
-              type: 'status',
-              event: 'tool_use',
-              tools: toolNames,
-            })}\n\n`);
+          if (stopReason === 'tool_use') {
+            const toolUseBlocks = contentBlocks.filter((b) => b.type === 'tool_use');
+            console.log(`[Chat] 模型请求工具调用: ${toolUseBlocks.map(b => b.name).join(', ')}`);
+
+            for (const tu of toolUseBlocks) {
+              if (tu.name === 'search_internet' && tu.input && tu.input.query) {
+                res.write(`data: ${JSON.stringify({ type: 'status', message: `正在搜索：${tu.input.query}` })}\n\n`);
+              }
+              if (tu.name === 'create_document' && tu.input && tu.input.title) {
+                const fmt = tu.input.format || 'markdown';
+                const fmtLabel = fmt === 'docx' ? 'Word 文档' : fmt === 'pptx' ? 'PPT 演示文稿' : '文档';
+                res.write(`data: ${JSON.stringify({ type: 'status', message: `正在创建${fmtLabel}：${tu.input.title}` })}\n\n`);
+              }
+            }
 
             workingMessages.push({ role: 'assistant', content: contentBlocks });
+            const toolContext = { userId: req.userId };
+            const toolResults = await toolExecutor.executeAll(toolUseBlocks, toolContext);
 
-            const toolResults = await toolExecutor.executeAll(toolUseBlocks);
+            const allSources = [];
+            for (const tr of toolResults) {
+              if (tr._meta && tr._meta.sources) allSources.push(...tr._meta.sources);
+              if (tr._meta && tr._meta._document) {
+                createdDocument = tr._meta._document;
+                res.write(`data: ${JSON.stringify({ type: 'document_created', document: tr._meta._document })}\n\n`);
+              }
+            }
+            if (allSources.length > 0) {
+              res.write(`data: ${JSON.stringify({ type: 'search_sources', sources: allSources })}\n\n`);
+            }
 
-            res.write(`data: ${JSON.stringify({
-              type: 'status',
-              event: 'tool_result',
-              results: toolResults.map((r) => ({
-                tool_use_id: r.tool_use_id,
-                is_error: r.is_error || false,
-              })),
-            })}\n\n`);
-
-            workingMessages.push({ role: 'user', content: toolResults });
+            const cleanResults = toolResults.map(({ _meta, ...rest }) => rest);
+            workingMessages.push({ role: 'user', content: cleanResults });
             continue;
           }
 
-          // end_turn 或其他
-          if (loopRound === 1) {
-            emitNonStreamAsSSE(res, apiResult);
-            for (const block of contentBlocks) {
-              if (block.type === 'text') {
-                assistantMessage += block.text;
-              }
-            }
-            usageData = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens };
-          } else {
-            needStreamFinal = true;
+          // end_turn — text 已实时转发，无需额外刷新
+
+          // 发送 message_delta + message_stop
+          if (roundResult.messageDeltaEvent) {
+            res.write(`data: ${JSON.stringify(roundResult.messageDeltaEvent)}\n\n`);
           }
+          res.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+
+          for (const block of contentBlocks) {
+            if (block.type === 'text') {
+              assistantMessage += block.text.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
+            }
+          }
+          usageData = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens, cache_creation_tokens: totalCacheCreationTokens, cache_read_tokens: totalCacheReadTokens };
           break;
         }
       }
-
-      // === 步骤 D：流式请求 ===
-      // skipToolLoop=true 时直接走这里；工具循环后 needStreamFinal=true 也走这里
-      if ((skipToolLoop || needStreamFinal) && !clientClosed) {
-        const streamBody = {
-          model,
-          max_tokens: config.MAX_OUTPUT_TOKENS,
-          stream: true,
-          system: systemPrompt,
-          messages: workingMessages,
-          thinking: { type: 'enabled', budget_tokens: config.THINKING_BUDGET_TOKENS },
-        };
-        // 流式请求也带 tools（让服务端工具生效）
-        if (hasTools) {
-          streamBody.tools = toolDefinitions;
-        }
-
-        console.log('[Chat] 发起流式请求, hasTools=%s, skipToolLoop=%s', hasTools, skipToolLoop);
-
-        const streamResponse = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-api-key': config.API_KEY,
-            'anthropic-version': '2023-06-01',
-          },
-          body: JSON.stringify(streamBody),
-          signal: controller.signal,
-        });
-
-        if (!streamResponse.ok) {
-          const errorText = await streamResponse.text();
-          console.error('[Chat] 流式请求失败:', streamResponse.status, errorText);
-          res.write(`data: ${JSON.stringify({ type: 'error', error: '上游接口错误', detail: errorText })}\n\n`);
-        } else if (streamResponse.body) {
-          const reader = streamResponse.body.getReader();
-          const decoder = new TextDecoder();
-          let sseBuffer = '';
-          // 跟踪每个 content block 的类型，key=index
-          const blockTypeMap = {};
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              if (clientClosed) break;
-
-              if (value) {
-                sseBuffer += decoder.decode(value, { stream: true });
-                const parts = sseBuffer.split('\n');
-                sseBuffer = parts.pop() || '';
-
-                for (const line of parts) {
-                  if (!line.startsWith('data: ')) continue;
-                  const data = line.slice(6).trim();
-                  if (data === '[DONE]') {
-                    res.write(`data: [DONE]\n\n`);
-                    continue;
-                  }
-
-                  let parsed;
-                  try {
-                    parsed = JSON.parse(data);
-                  } catch (e) {
-                    continue;
-                  }
-
-                  // --- content_block_start：记录 block 类型，按类型分发 ---
-                  if (parsed.type === 'content_block_start' && parsed.content_block) {
-                    const idx = parsed.index;
-                    const blockType = parsed.content_block.type;
-                    blockTypeMap[idx] = blockType;
-
-                    if (blockType === 'thinking' || blockType === 'text') {
-                      // 透传给前端
-                      res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                    } else if (blockType === 'server_tool_use') {
-                      // 发送搜索状态通知（不透传原始事件）
-                      const query = (parsed.content_block.input && parsed.content_block.input.query) || '';
-                      if (query) {
-                        res.write(`data: ${JSON.stringify({
-                          type: 'status',
-                          message: `正在搜索：${query}`,
-                        })}\n\n`);
-                      }
-                    } else if (blockType === 'web_search_tool_result') {
-                      // 提取搜索来源（不透传原始事件）
-                      const searchResults = parsed.content_block.content;
-                      if (Array.isArray(searchResults)) {
-                        const sources = searchResults
-                          .filter((r) => r.type === 'web_search_result')
-                          .map((r) => ({ url: r.url, title: r.title }));
-                        if (sources.length > 0) {
-                          res.write(`data: ${JSON.stringify({
-                            type: 'search_sources',
-                            sources,
-                          })}\n\n`);
-                        }
-                      }
-                    }
-                    // 其他未知 block 类型：静默忽略
-                    continue;
-                  }
-
-                  // --- content_block_delta：只转发 thinking/text block 的 delta ---
-                  if (parsed.type === 'content_block_delta') {
-                    const idx = parsed.index;
-                    const blockType = blockTypeMap[idx];
-
-                    if (blockType === 'thinking' || blockType === 'text') {
-                      res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                      // 累积助手文本
-                      if (parsed.delta && parsed.delta.type === 'text_delta') {
-                        assistantMessage += parsed.delta.text;
-                      }
-                    }
-                    // server_tool_use / web_search_tool_result 的 delta：静默忽略
-                    continue;
-                  }
-
-                  // --- content_block_stop：只转发 thinking/text block ---
-                  if (parsed.type === 'content_block_stop') {
-                    const idx = parsed.index;
-                    const blockType = blockTypeMap[idx];
-                    if (blockType === 'thinking' || blockType === 'text') {
-                      res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                    }
-                    continue;
-                  }
-
-                  // --- message_start / message_delta / message_stop：直接透传 ---
-                  if (parsed.type === 'message_start' || parsed.type === 'message_stop') {
-                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                    continue;
-                  }
-
-                  if (parsed.type === 'message_delta') {
-                    if (parsed.usage) {
-                      totalInputTokens += parsed.usage.input_tokens || 0;
-                      totalOutputTokens += parsed.usage.output_tokens || 0;
-                    }
-                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                    continue;
-                  }
-
-                  // --- ping / error 等其他事件：透传 ---
-                  res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                }
-              }
-            }
-          } finally {
-            try { reader.releaseLock(); } catch (e) { }
-          }
-        }
-        usageData = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens };
-      }
     } finally {
-      // === 步骤 E：保存到数据库 ===
+      // === 步骤 E：保存到数据库 + 释放密钥池 ===
       res.end();
+
+      // 释放密钥池并记录结果
+      if (poolKey) {
+        keyPool.release(poolKey.id);
+        if (assistantMessage) {
+          keyPool.recordSuccess(poolKey.id, totalInputTokens, totalOutputTokens, totalCacheCreationTokens, totalCacheReadTokens);
+        }
+      }
 
       if (assistantMessage) {
         try {
           const msgId = uuidv4();
+          const documentJson = createdDocument ? JSON.stringify(createdDocument) : null;
           db.prepare(
-            'INSERT INTO messages (id, conversation_id, role, content, has_attachments) VALUES (?, ?, ?, ?, ?)'
-          ).run(msgId, conversationId, 'assistant', assistantMessage, 0);
+            'INSERT INTO messages (id, conversation_id, role, content, has_attachments, document_json) VALUES (?, ?, ?, ?, ?, ?)'
+          ).run(msgId, conversationId, 'assistant', assistantMessage, 0, documentJson);
 
           if (usageData) {
             contextManager.saveTokenUsage(msgId, messageId, usageData);
-            contextManager.updateUserTokenUsage(req.userId, usageData.input_tokens || 0, usageData.output_tokens || 0);
 
-            // 累加订阅额度使用量
-            const totalTokens = (usageData.input_tokens || 0) + (usageData.output_tokens || 0);
-            if (totalTokens > 0) {
-              const currentSub = db.prepare(
-                "SELECT id FROM user_subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') AND starts_at <= datetime('now') ORDER BY created_at ASC LIMIT 1"
-              ).get(req.userId);
-              if (currentSub) {
-                db.prepare(
-                  'UPDATE user_subscriptions SET tokens_used = tokens_used + ? WHERE id = ?'
-                ).run(totalTokens, currentSub.id);
-              }
+            // User quota: always 1x (fair billing regardless of which key)
+            const userCost = billing.calculateCost(model, usageData, 1.0);
+            const dollarUnits = quotaEngine.recordUsage(req.userId, userCost);
+
+            // Site cost: actual key multiplier (for profit tracking)
+            const groupMultiplier = poolKey ? (poolKey.group_multiplier || 1.0) : 1.0;
+            const siteCost = billing.calculateCost(model, usageData, groupMultiplier);
+            const siteCostUnits = billing.dollarToUnits(siteCost);
+
+            console.log(`[Billing] model=${model}, input=${usageData.input_tokens}, output=${usageData.output_tokens}, cache_create=${usageData.cache_creation_tokens}, cache_read=${usageData.cache_read_tokens}, group=${groupMultiplier}, userCost=$${userCost.toFixed(6)}, siteCost=$${siteCost.toFixed(6)}`);
+
+            if (poolKey && siteCostUnits > 0) {
+              keyPool.recordCostUnits(poolKey.id, siteCostUnits);
             }
           }
 
@@ -664,90 +736,15 @@ router.post('/', async (req, res, next) => {
     return undefined;
   } catch (err) {
     console.error('[chat] error', err);
+    if (poolKey) {
+      keyPool.recordError(poolKey.id, err.message || 'unknown');
+      keyPool.release(poolKey.id);
+    }
     if (err && err.name === 'AbortError') {
       return undefined;
     }
     return next(err);
   }
 });
-
-/**
- * 将非流式 API 响应转为 SSE 事件发送给客户端
- */
-function emitNonStreamAsSSE(res, apiResult) {
-  const contentBlocks = apiResult.content || [];
-
-  // message_start
-  res.write(`data: ${JSON.stringify({
-    type: 'message_start',
-    message: {
-      id: apiResult.id,
-      type: 'message',
-      role: 'assistant',
-      model: apiResult.model,
-    },
-  })}\n\n`);
-
-  // 逐个 content block
-  for (let i = 0; i < contentBlocks.length; i++) {
-    const block = contentBlocks[i];
-
-    if (block.type === 'thinking') {
-      res.write(`data: ${JSON.stringify({
-        type: 'content_block_start',
-        index: i,
-        content_block: { type: 'thinking', thinking: '' },
-      })}\n\n`);
-      res.write(`data: ${JSON.stringify({
-        type: 'content_block_delta',
-        index: i,
-        delta: { type: 'thinking_delta', thinking: block.thinking },
-      })}\n\n`);
-      res.write(`data: ${JSON.stringify({
-        type: 'content_block_stop',
-        index: i,
-      })}\n\n`);
-    } else if (block.type === 'server_tool_use') {
-      // 服务端工具调用 — 发送搜索状态通知
-      const query = (block.input && block.input.query) || '';
-      res.write(`data: ${JSON.stringify({
-        type: 'status',
-        message: `正在搜索：${query}`,
-      })}\n\n`);
-    } else if (block.type === 'web_search_tool_result') {
-      // 搜索结果 — 不发给前端，模型会自己消化
-    } else if (block.type === 'text') {
-      res.write(`data: ${JSON.stringify({
-        type: 'content_block_start',
-        index: i,
-        content_block: { type: 'text', text: '' },
-      })}\n\n`);
-      // 带 citations 的 text block，将 citations 放入 delta 透传
-      const delta = { type: 'text_delta', text: block.text };
-      if (block.citations) {
-        delta.citations = block.citations;
-      }
-      res.write(`data: ${JSON.stringify({
-        type: 'content_block_delta',
-        index: i,
-        delta,
-      })}\n\n`);
-      res.write(`data: ${JSON.stringify({
-        type: 'content_block_stop',
-        index: i,
-      })}\n\n`);
-    }
-  }
-
-  // message_delta with usage
-  res.write(`data: ${JSON.stringify({
-    type: 'message_delta',
-    delta: { stop_reason: 'end_turn' },
-    usage: apiResult.usage || {},
-  })}\n\n`);
-
-  // message_stop
-  res.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-}
 
 module.exports = router;

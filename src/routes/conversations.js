@@ -98,14 +98,21 @@ router.get('/:id', (req, res, next) => {
     const messages = db
       .prepare(
         `
-          SELECT id, role, content, has_attachments, is_summary, compacted, created_at
+          SELECT id, role, content, has_attachments, is_summary, compacted, document_json, created_at
           FROM messages
-          WHERE conversation_id = ?
+          WHERE conversation_id = ? AND compacted = 0
           ORDER BY created_at ASC
         `
       )
       .all(id)
-      .map((message) => ({ ...message, attachments: [] }));
+      .map((message) => {
+        const msg = { ...message, attachments: [] };
+        if (msg.document_json) {
+          try { msg.document = JSON.parse(msg.document_json); } catch {}
+        }
+        delete msg.document_json;
+        return msg;
+      });
 
     const messageIdsNeedingAttachments = messages
       .filter((message) => message.has_attachments === 1)

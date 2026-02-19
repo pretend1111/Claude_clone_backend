@@ -26,8 +26,8 @@ function saveTokenUsage(assistantMessageId, userMessageId, usage) {
   const db = getDb();
   const tx = db.transaction(() => {
     if (usage.input_tokens && userMessageId) {
-      db.prepare('UPDATE messages SET input_tokens = ? WHERE id = ?')
-        .run(usage.input_tokens, userMessageId);
+      db.prepare('UPDATE messages SET input_tokens = ?, cache_creation_tokens = ?, cache_read_tokens = ? WHERE id = ?')
+        .run(usage.input_tokens, usage.cache_creation_tokens || 0, usage.cache_read_tokens || 0, userMessageId);
     }
     if (usage.output_tokens && assistantMessageId) {
       db.prepare('UPDATE messages SET output_tokens = ? WHERE id = ?')
@@ -38,13 +38,12 @@ function saveTokenUsage(assistantMessageId, userMessageId, usage) {
 }
 
 // === updateUserTokenUsage ===
-function updateUserTokenUsage(userId, inputTokens, outputTokens) {
+function updateUserTokenUsage(userId, dollarUnits) {
   const db = getDb();
-  const total = (inputTokens || 0) + (outputTokens || 0);
-  if (total <= 0) return;
+  if (dollarUnits <= 0) return;
   db.prepare(
     'UPDATE users SET token_used = token_used + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-  ).run(total, userId);
+  ).run(dollarUnits, userId);
 }
 
 // === pruneMessages ===

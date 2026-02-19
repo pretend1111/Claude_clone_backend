@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const { Resend } = require('resend');
@@ -13,7 +14,35 @@ const resend = new Resend(config.RESEND_API_KEY);
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_LOGIN_ATTEMPTS = 5;
+const MAX_SESSIONS = 5;
 const LOCK_DURATION_MINUTES = 15;
+
+function getLocationFromIp(ip) {
+  if (!ip) return 'Unknown Location';
+  if (ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168.') || ip.startsWith('10.')) {
+    return 'Local Network';
+  }
+  // TODO: Integrate real GeoIP service
+  return 'Unknown Location';
+}
+
+function parseDevice(ua) {
+  if (!ua) return '未知设备';
+  let os = '未知';
+  if (/Windows/i.test(ua)) os = 'Windows';
+  else if (/Mac OS/i.test(ua)) os = 'macOS';
+  else if (/Android/i.test(ua)) os = 'Android';
+  else if (/iPhone|iPad/i.test(ua)) os = 'iOS';
+  else if (/Linux/i.test(ua)) os = 'Linux';
+
+  let browser = '';
+  if (/Edg\//i.test(ua)) browser = 'Edge';
+  else if (/Chrome\//i.test(ua)) browser = 'Chrome';
+  else if (/Safari\//i.test(ua) && !/Chrome/i.test(ua)) browser = 'Safari';
+  else if (/Firefox\//i.test(ua)) browser = 'Firefox';
+
+  return browser ? `${os} · ${browser}` : os;
+}
 
 // 生成 6 位数字验证码
 function generateCode() {
@@ -138,11 +167,16 @@ router.post('/login', loginRateLimit, (req, res) => {
 
   const db = getDb();
   const userRecord = db.prepare(
-    'SELECT id, email, password_hash, nickname, plan, login_attempts, locked_until FROM users WHERE email = ?'
+    'SELECT id, email, password_hash, nickname, plan, role, banned, login_attempts, locked_until FROM users WHERE email = ?'
   ).get(email);
 
   if (!userRecord) {
     return res.status(401).json({ error: '邮箱或密码错误' });
+  }
+
+  // 检查是否被封禁
+  if (userRecord.banned) {
+    return res.status(403).json({ error: '账号已被封禁' });
   }
 
   // 检查是否被锁定
@@ -168,11 +202,34 @@ router.post('/login', loginRateLimit, (req, res) => {
   db.prepare('UPDATE users SET login_attempts = 0, locked_until = NULL WHERE id = ?').run(userRecord.id);
 
   const token = generateToken(userRecord.id);
+
+  // 创建会话记录
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const ua = req.headers['user-agent'] || '';
+  const ip = req.headers['x-forwarded-for'] || req.ip || '';
+  // Clean up IP (handle ::ffff: prefix)
+  const cleanIp = ip.replace(/^::ffff:/, '');
+  const device = parseDevice(ua);
+  const sessionId = uuidv4();
+
+  // 如果已有 >= MAX_SESSIONS 个会话，删除最旧的
+  const sessionCount = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE user_id = ?').get(userRecord.id).count;
+  if (sessionCount >= MAX_SESSIONS) {
+    db.prepare(
+      'DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE user_id = ? ORDER BY last_active ASC LIMIT ?)'
+    ).run(userRecord.id, sessionCount - MAX_SESSIONS + 1);
+  }
+
+  db.prepare(
+    'INSERT INTO sessions (id, user_id, token_hash, device, ip, location) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(sessionId, userRecord.id, tokenHash, device, ip, getLocationFromIp(ip));
+
   const user = {
     id: userRecord.id,
     email: userRecord.email,
     nickname: userRecord.nickname,
     plan: userRecord.plan,
+    role: userRecord.role || 'user',
   };
   return res.json({ token, user });
 });

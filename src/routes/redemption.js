@@ -58,17 +58,27 @@ router.post('/redeem', auth, redeemRateLimit, (req, res, next) => {
         "INSERT INTO orders (id, user_id, plan_id, amount, payment_method, status, paid_at) VALUES (?, ?, ?, 0, 'redemption', 'paid', datetime('now'))"
       ).run(orderId, req.userId, plan.id);
 
-      // 检查是否有活跃订阅，延长而非覆盖
-      const existingSub = db.prepare(
-        "SELECT * FROM user_subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1"
+      // 检查当前生效的订阅（升级场景）
+      const activeSub = db.prepare(
+        "SELECT s.*, p.price as current_price FROM user_subscriptions s JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.starts_at <= datetime('now') AND s.expires_at > datetime('now') ORDER BY p.price DESC LIMIT 1"
       ).get(req.userId);
 
       const subId = uuidv4();
-      let startsAt, expiresAt;
+      let startsAt, expiresAt, tokensUsed = 0;
 
-      if (existingSub) {
-        startsAt = existingSub.expires_at;
-        const baseDate = new Date(existingSub.expires_at);
+      if (activeSub && plan.price > activeSub.current_price) {
+        // 升级：保持原到期时间，沿用已使用额度
+        startsAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
+        expiresAt = activeSub.expires_at;
+        tokensUsed = Number(activeSub.tokens_used) || 0;
+
+        db.prepare(
+          "UPDATE user_subscriptions SET status = 'upgraded' WHERE id = ?"
+        ).run(activeSub.id);
+      } else if (activeSub) {
+        // 有活跃订阅但不是升级，在到期后开始
+        startsAt = activeSub.expires_at;
+        const baseDate = new Date(activeSub.expires_at);
         baseDate.setDate(baseDate.getDate() + plan.duration_days);
         expiresAt = baseDate.toISOString().replace('T', ' ').slice(0, 19);
       } else {
@@ -79,8 +89,8 @@ router.post('/redeem', auth, redeemRateLimit, (req, res, next) => {
       }
 
       db.prepare(
-        'INSERT INTO user_subscriptions (id, user_id, plan_id, order_id, token_quota, tokens_used, starts_at, expires_at, status) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)'
-      ).run(subId, req.userId, plan.id, orderId, plan.token_quota, startsAt, expiresAt, 'active');
+        'INSERT INTO user_subscriptions (id, user_id, plan_id, order_id, token_quota, tokens_used, starts_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(subId, req.userId, plan.id, orderId, plan.token_quota, tokensUsed, startsAt, expiresAt, 'active');
 
       // 更新用户存储配额（取套餐配额和当前配额的较大值）
       if (plan.storage_quota) {

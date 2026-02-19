@@ -37,6 +37,15 @@ router.post('/create', auth, paymentCreateRateLimit, (req, res, next) => {
       return res.status(404).json({ error: '套餐不存在或已下架' });
     }
 
+    // 检查当前活跃订阅，禁止购买同级或低级套餐
+    const activeSub = db.prepare(
+      "SELECT s.*, p.price as current_price FROM user_subscriptions s JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.starts_at <= datetime('now') AND s.expires_at > datetime('now') ORDER BY p.price DESC LIMIT 1"
+    ).get(req.userId);
+
+    if (activeSub && plan.price <= activeSub.current_price) {
+      return res.status(400).json({ error: '当前套餐等级已等于或高于所选套餐，无法购买' });
+    }
+
     const orderId = uuidv4();
     db.prepare(
       'INSERT INTO orders (id, user_id, plan_id, amount, payment_method, status) VALUES (?, ?, ?, ?, ?, ?)'
@@ -114,18 +123,31 @@ router.post('/callback', (req, res, next) => {
       return res.status(500).json({ error: '套餐信息异常' });
     }
 
-    // 检查是否有同类未过期订阅，延长而非覆盖
-    const existingSub = db.prepare(
-      "SELECT * FROM user_subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1"
+    // 检查是否有当前生效的订阅（升级场景）
+    const activeSub = db.prepare(
+      "SELECT s.*, p.price as current_price FROM user_subscriptions s JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.starts_at <= datetime('now') AND s.expires_at > datetime('now') ORDER BY p.price DESC LIMIT 1"
     ).get(order.user_id);
 
     const subId = uuidv4();
-    let startsAt, expiresAt;
+    let startsAt, expiresAt, tokensUsed = 0;
 
-    if (existingSub) {
+    if (activeSub && plan.price > activeSub.current_price) {
+      // 升级：保持原到期时间，沿用已使用额度
+      startsAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      expiresAt = activeSub.expires_at;
+      tokensUsed = Number(activeSub.tokens_used) || 0;
+
+      // 将旧订阅标记为已升级
+      db.prepare(
+        "UPDATE user_subscriptions SET status = 'upgraded' WHERE id = ?"
+      ).run(activeSub.id);
+
+      console.log(`[Payment] Upgrade: old_sub=${activeSub.id}, old_plan_price=${activeSub.current_price}, new_plan_price=${plan.price}, tokens_carried=${tokensUsed}`);
+    } else if (activeSub) {
+      // 有活跃订阅但不是升级（同级或降级 — 理论上 create 已拦截，但回调兜底）
       // 在现有订阅到期后开始
-      startsAt = existingSub.expires_at;
-      const baseDate = new Date(existingSub.expires_at);
+      startsAt = activeSub.expires_at;
+      const baseDate = new Date(activeSub.expires_at);
       baseDate.setDate(baseDate.getDate() + plan.duration_days);
       expiresAt = baseDate.toISOString().replace('T', ' ').slice(0, 19);
     } else {
@@ -136,8 +158,8 @@ router.post('/callback', (req, res, next) => {
     }
 
     db.prepare(
-      'INSERT INTO user_subscriptions (id, user_id, plan_id, order_id, token_quota, tokens_used, starts_at, expires_at, status) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)'
-    ).run(subId, order.user_id, plan.id, order_id, plan.token_quota, startsAt, expiresAt, 'active');
+      'INSERT INTO user_subscriptions (id, user_id, plan_id, order_id, token_quota, tokens_used, starts_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(subId, order.user_id, plan.id, order_id, plan.token_quota, tokensUsed, startsAt, expiresAt, 'active');
 
     // 更新用户存储配额（取套餐配额和当前配额的较大值）
     if (plan.storage_quota) {
@@ -168,62 +190,6 @@ router.get('/status/:orderId', auth, (req, res, next) => {
     }
 
     return res.json(order);
-  } catch (err) {
-    return next(err);
-  }
-});
-
-// POST /api/payment/mock-pay/:orderId — 模拟支付（仅开发环境，需登录）
-router.post('/mock-pay/:orderId', auth, (req, res, next) => {
-  const db = getDb();
-  try {
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.orderId);
-    if (!order) {
-      return res.status(404).json({ error: '订单不存在' });
-    }
-    if (order.user_id !== req.userId) {
-      return res.status(403).json({ error: '无权操作' });
-    }
-    if (order.status === 'paid') {
-      return res.json({ success: true, message: '已支付' });
-    }
-
-    // 直接标记为已支付
-    db.prepare(
-      "UPDATE orders SET status = 'paid', paid_at = CURRENT_TIMESTAMP WHERE id = ?"
-    ).run(order.id);
-
-    const plan = db.prepare('SELECT * FROM plans WHERE id = ?').get(order.plan_id);
-
-    const existingSub = db.prepare(
-      "SELECT * FROM user_subscriptions WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1"
-    ).get(order.user_id);
-
-    const subId = uuidv4();
-    let startsAt, expiresAt;
-
-    if (existingSub) {
-      startsAt = existingSub.expires_at;
-      const baseDate = new Date(existingSub.expires_at);
-      baseDate.setDate(baseDate.getDate() + plan.duration_days);
-      expiresAt = baseDate.toISOString().replace('T', ' ').slice(0, 19);
-    } else {
-      startsAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
-      const expDate = new Date();
-      expDate.setDate(expDate.getDate() + plan.duration_days);
-      expiresAt = expDate.toISOString().replace('T', ' ').slice(0, 19);
-    }
-
-    db.prepare(
-      'INSERT INTO user_subscriptions (id, user_id, plan_id, order_id, token_quota, tokens_used, starts_at, expires_at, status) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)'
-    ).run(subId, order.user_id, plan.id, order.id, plan.token_quota, startsAt, expiresAt, 'active');
-
-    if (plan.storage_quota) {
-      db.prepare('UPDATE users SET storage_quota = MAX(storage_quota, ?) WHERE id = ?').run(plan.storage_quota, order.user_id);
-    }
-
-    console.log(`[Payment] Mock pay: order=${order.id}, sub=${subId}`);
-    return res.json({ success: true });
   } catch (err) {
     return next(err);
   }

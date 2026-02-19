@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 
 const { getDb } = require('../db/init');
 const { generateToken } = require('../utils/token');
+const quotaEngine = require('../lib/quotaEngine');
 
 const router = express.Router();
 
@@ -20,10 +21,10 @@ router.get('/profile', (req, res, next) => {
       .prepare(
         `
           SELECT
-            id, email, nickname, plan,
+            id, email, nickname, plan, role,
             token_quota, token_used, storage_quota, storage_used,
             full_name, display_name, work_function, personal_preferences,
-            theme, chat_font, created_at
+            theme, chat_font, default_model, created_at
           FROM users
           WHERE id = ?
         `
@@ -32,6 +33,11 @@ router.get('/profile', (req, res, next) => {
 
     if (!user) {
       return res.status(404).json({ error: '用户不存在' });
+    }
+
+    // 检查是否被封禁
+    if (user.banned) {
+      return res.status(403).json({ error: '账号已被封禁' });
     }
 
     // Token 剩余不足 7 天时自动续期
@@ -67,7 +73,7 @@ router.get('/usage', (req, res, next) => {
 
     // 查询活跃订阅
     const activeSub = db.prepare(
-      "SELECT s.*, p.name as plan_name, p.storage_quota as plan_storage_quota FROM user_subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.expires_at > datetime('now') ORDER BY s.created_at ASC LIMIT 1"
+      "SELECT s.*, p.name as plan_name, p.price as plan_price, p.storage_quota as plan_storage_quota FROM user_subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.starts_at <= datetime('now') AND s.expires_at > datetime('now') ORDER BY p.price DESC LIMIT 1"
     ).get(req.userId);
 
     // 消息统计
@@ -88,23 +94,29 @@ router.get('/usage', (req, res, next) => {
       tokenUsed = Number(user.token_used) || 0;
     }
 
+    // Convert internal units to dollar values ($0.0001 = 1 unit)
+    const dollarQuota = tokenQuota / 10000;
+    const dollarUsed = tokenUsed / 10000;
+    const dollarRemaining = dollarQuota - dollarUsed;
+
     const storageQuota = activeSub && activeSub.plan_storage_quota
       ? Math.max(Number(user.storage_quota) || 0, Number(activeSub.plan_storage_quota))
       : Number(user.storage_quota) || 0;
     const storageUsed = Number(user.storage_used) || 0;
 
-    const tokenRemaining = tokenQuota - tokenUsed;
     const storageRemaining = storageQuota - storageUsed;
 
     return res.json({
       plan: activeSub ? {
+        id: activeSub.plan_id,
         name: activeSub.plan_name,
+        price: activeSub.plan_price,
         expires_at: activeSub.expires_at,
         status: 'active',
       } : null,
-      token_quota: tokenQuota,
-      token_used: tokenUsed,
-      token_remaining: tokenRemaining,
+      token_quota: dollarQuota,
+      token_used: dollarUsed,
+      token_remaining: dollarRemaining,
       usage_percent: toPercent(tokenUsed, tokenQuota),
       storage_quota: storageQuota,
       storage_used: storageUsed,
@@ -114,6 +126,7 @@ router.get('/usage', (req, res, next) => {
         today: todayMessages?.count || 0,
         month: monthMessages?.count || 0,
       },
+      quota: quotaEngine.getQuotaInfo(req.userId),
     });
   } catch (err) {
     return next(err);
@@ -121,7 +134,7 @@ router.get('/usage', (req, res, next) => {
 });
 
 router.patch('/profile', (req, res, next) => {
-  const { nickname, password, full_name, display_name, work_function, personal_preferences, theme, chat_font } = req.body || {};
+  const { nickname, password, full_name, display_name, work_function, personal_preferences, theme, chat_font, default_model } = req.body || {};
 
   const updates = [];
   const values = [];
@@ -167,6 +180,10 @@ router.patch('/profile', (req, res, next) => {
     updates.push('chat_font = ?');
     values.push(chat_font);
   }
+  if (typeof default_model === 'string') {
+    updates.push('default_model = ?');
+    values.push(default_model);
+  }
 
   if (updates.length === 0) {
     return res.status(400).json({ error: '未提供可更新字段' });
@@ -186,10 +203,10 @@ router.patch('/profile', (req, res, next) => {
       .prepare(
         `
           SELECT
-            id, email, nickname, plan,
+            id, email, nickname, plan, role,
             token_quota, token_used, storage_quota, storage_used,
             full_name, display_name, work_function, personal_preferences,
-            theme, chat_font, created_at
+            theme, chat_font, default_model, created_at
           FROM users
           WHERE id = ?
         `
@@ -200,6 +217,106 @@ router.patch('/profile', (req, res, next) => {
   } catch (err) {
     return next(err);
   }
+});
+
+// === 会话管理 ===
+
+// 获取当前用户的所有活跃会话
+router.get('/sessions', (req, res, next) => {
+  const db = getDb();
+  try {
+    const sessions = db.prepare(
+      'SELECT id, device, ip, location, last_active, created_at FROM sessions WHERE user_id = ? ORDER BY last_active DESC'
+    ).all(req.userId);
+    return res.json({ sessions, currentSessionId: req.sessionId });
+  } catch (err) { return next(err); }
+});
+
+// 登出指定会话
+router.delete('/sessions/:id', (req, res, next) => {
+  const db = getDb();
+  try {
+    if (req.params.id === req.sessionId) {
+      return res.status(400).json({ error: '不能登出当前会话，请使用退出登录' });
+    }
+    const result = db.prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?').run(req.params.id, req.userId);
+    if (result.changes === 0) return res.status(404).json({ error: '会话不存在' });
+    return res.json({ success: true });
+  } catch (err) { return next(err); }
+});
+
+// 登出所有其他会话
+router.post('/sessions/logout-others', (req, res, next) => {
+  const db = getDb();
+  try {
+    const result = db.prepare('DELETE FROM sessions WHERE user_id = ? AND id != ?').run(req.userId, req.sessionId || '');
+    return res.json({ success: true, count: result.changes });
+  } catch (err) { return next(err); }
+});
+
+// === 修改密码（需要旧密码验证）===
+router.post('/change-password', (req, res, next) => {
+  const { current_password, new_password } = req.body || {};
+  if (!current_password || !new_password) {
+    return res.status(400).json({ error: '请提供当前密码和新密码' });
+  }
+  if (new_password.length < 6) {
+    return res.status(400).json({ error: '新密码至少 6 位' });
+  }
+  const db = getDb();
+  try {
+    const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.userId);
+    if (!user) return res.status(404).json({ error: '用户不存在' });
+
+    if (!bcrypt.compareSync(current_password, user.password_hash)) {
+      return res.status(400).json({ error: '当前密码错误' });
+    }
+
+    const newHash = bcrypt.hashSync(new_password, 10);
+    db.prepare('UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newHash, req.userId);
+
+    // 修改密码后登出所有其他会话
+    db.prepare('DELETE FROM sessions WHERE user_id = ? AND id != ?').run(req.userId, req.sessionId || '');
+
+    return res.json({ success: true });
+  } catch (err) { return next(err); }
+});
+
+// === 注销账号 ===
+router.post('/delete-account', (req, res, next) => {
+  const { password } = req.body || {};
+  if (!password) return res.status(400).json({ error: '请输入密码确认' });
+
+  const db = getDb();
+  try {
+    const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.userId);
+    if (!user) return res.status(404).json({ error: '用户不存在' });
+
+    if (!bcrypt.compareSync(password, user.password_hash)) {
+      return res.status(400).json({ error: '密码错误' });
+    }
+
+    // 检查是否有活跃订阅
+    const activeSub = db.prepare(
+      "SELECT s.id, p.name, s.expires_at FROM user_subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.expires_at > datetime('now') LIMIT 1"
+    ).get(req.userId);
+    if (activeSub) {
+      return res.status(400).json({
+        error: `您当前有活跃订阅「${activeSub.name}」（到期时间：${activeSub.expires_at.slice(0, 10)}），请等待订阅到期后再注销账号`,
+        code: 'HAS_SUBSCRIPTION',
+      });
+    }
+
+    // 删除关联数据
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.userId);
+    db.prepare('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)').run(req.userId);
+    db.prepare('DELETE FROM conversations WHERE user_id = ?').run(req.userId);
+    db.prepare('DELETE FROM user_subscriptions WHERE user_id = ?').run(req.userId);
+    db.prepare('DELETE FROM orders WHERE user_id = ?').run(req.userId);
+    db.prepare('DELETE FROM users WHERE id = ?').run(req.userId);
+
+    return res.json({ success: true });
+  } catch (err) { return next(err); }
 });
 
 module.exports = router;
