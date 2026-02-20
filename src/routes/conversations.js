@@ -98,7 +98,7 @@ router.get('/:id', (req, res, next) => {
     const messages = db
       .prepare(
         `
-          SELECT id, role, content, has_attachments, is_summary, compacted, document_json, created_at
+          SELECT id, role, content, has_attachments, is_summary, compacted, document_json, thinking, thinking_summary, citations_json, search_logs, created_at
           FROM messages
           WHERE conversation_id = ? AND compacted = 0
           ORDER BY created_at ASC
@@ -111,6 +111,14 @@ router.get('/:id', (req, res, next) => {
           try { msg.document = JSON.parse(msg.document_json); } catch {}
         }
         delete msg.document_json;
+        if (msg.citations_json) {
+          try { msg.citations = JSON.parse(msg.citations_json); } catch {}
+        }
+        delete msg.citations_json;
+        if (msg.search_logs) {
+          try { msg.searchLogs = JSON.parse(msg.search_logs); } catch {}
+        }
+        delete msg.search_logs;
         return msg;
       });
 

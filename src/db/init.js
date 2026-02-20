@@ -84,6 +84,15 @@ function init() {
   if (!columnNames.has('compacted')) {
     db.exec('ALTER TABLE messages ADD COLUMN compacted INTEGER DEFAULT 0');
   }
+  if (!columnNames.has('search_logs')) {
+    db.exec('ALTER TABLE messages ADD COLUMN search_logs TEXT');
+  }
+  if (!columnNames.has('thinking')) {
+    db.exec('ALTER TABLE messages ADD COLUMN thinking TEXT');
+  }
+  if (!columnNames.has('thinking_summary')) {
+    db.exec('ALTER TABLE messages ADD COLUMN thinking_summary TEXT');
+  }
 
   // === 数据库迁移：attachments 表添加 id 列 + 扩展 file_type ===
   const attachmentColumns = db.pragma('table_info(attachments)');
@@ -431,6 +440,14 @@ function init() {
     db.exec('ALTER TABLE messages ADD COLUMN document_json TEXT');
     console.log('[DB] Migrated messages: added document_json');
   }
+  if (!msgColNames2.has('thinking')) {
+    db.exec('ALTER TABLE messages ADD COLUMN thinking TEXT');
+    console.log('[DB] Migrated messages: added thinking');
+  }
+  if (!msgColNames2.has('citations_json')) {
+    db.exec('ALTER TABLE messages ADD COLUMN citations_json TEXT');
+    console.log('[DB] Migrated messages: added citations_json');
+  }
 
   // === 数据库迁移：套餐额度从 token 改为美元单位 ===
   // token_quota 字段含义改为美元额度 × 10000（$0.0001 = 1 unit）
@@ -535,6 +552,44 @@ function init() {
     db.prepare("UPDATE plans SET weekly_budget = 37.5 WHERE name = '专业月卡'").run();
     db.prepare("UPDATE plans SET weekly_budget = 95.0 WHERE name = '尊享月卡'").run();
     console.log('[DB] Updated weekly_budget to 7.5-day cycle: 基础18.75, 专业37.5, 尊享95');
+  }
+
+  // === 数据库迁移：api_keys 增加 key_type 列 ===
+  const akCols2 = db.pragma('table_info(api_keys)');
+  const akColNames2 = new Set(akCols2.map(col => col.name));
+  if (!akColNames2.has('key_type')) {
+    db.exec("ALTER TABLE api_keys ADD COLUMN key_type TEXT DEFAULT 'streaming' CHECK (key_type IN ('streaming','non_streaming'))");
+    console.log('[DB] Migrated api_keys: added key_type');
+  }
+
+  // === 数据库迁移：plans 增加 plan_type 列 ===
+  const planCols3 = db.pragma('table_info(plans)');
+  const planColNames3 = new Set(planCols3.map(col => col.name));
+  if (!planColNames3.has('plan_type')) {
+    db.exec("ALTER TABLE plans ADD COLUMN plan_type TEXT DEFAULT 'streaming' CHECK (plan_type IN ('streaming','non_streaming'))");
+    console.log('[DB] Migrated plans: added plan_type');
+  }
+
+  // === 数据库迁移：非流式套餐已废弃，跳过插入 ===
+  // 保留 plan_type / key_type 列（SQLite 不支持 DROP COLUMN），只是不再使用 non_streaming 值
+  const nsCount = db.prepare("SELECT COUNT(*) as count FROM plans WHERE plan_type = 'non_streaming'").get().count;
+  if (nsCount === 0) {
+    // 更新正常版套餐额度和预算
+    db.prepare("UPDATE plans SET token_quota = 200000, window_budget = 0, weekly_budget = 0 WHERE name = '体验包' AND plan_type = 'streaming'").run();
+    db.prepare("UPDATE plans SET token_quota = 1000000, window_budget = 8.0, weekly_budget = 25.0 WHERE name = '基础月卡' AND plan_type = 'streaming'").run();
+    db.prepare("UPDATE plans SET token_quota = 2600000, window_budget = 20.8, weekly_budget = 65.0 WHERE name = '专业月卡' AND plan_type = 'streaming'").run();
+    db.prepare("UPDATE plans SET token_quota = 5000000, window_budget = 39.5, weekly_budget = 125.0 WHERE name = '尊享月卡' AND plan_type = 'streaming'").run();
+
+    // 同步活跃订阅的额度
+    db.prepare("UPDATE user_subscriptions SET token_quota = (SELECT token_quota FROM plans WHERE plans.id = user_subscriptions.plan_id) WHERE status = 'active'").run();
+    console.log('[DB] Updated streaming plan quotas');
+  }
+
+  // === 数据库迁移：体验包去掉窗口/周期限制 ===
+  const trialWindowCheck = db.prepare("SELECT window_budget FROM plans WHERE name = '体验包' AND plan_type = 'streaming'").get();
+  if (trialWindowCheck && trialWindowCheck.window_budget > 0) {
+    db.prepare("UPDATE plans SET window_budget = 0, weekly_budget = 0 WHERE name = '体验包'").run();
+    console.log('[DB] Cleared window_budget/weekly_budget for 体验包');
   }
 
   dbInstance = db;

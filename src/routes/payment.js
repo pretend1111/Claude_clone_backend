@@ -37,27 +37,33 @@ router.post('/create', auth, paymentCreateRateLimit, (req, res, next) => {
       return res.status(404).json({ error: '套餐不存在或已下架' });
     }
 
-    // 检查当前活跃订阅，禁止购买同级或低级套餐
+    // 检查当前活跃订阅，禁止购买同级或低级套餐（跨类型也按额度等级比较）
     const activeSub = db.prepare(
-      "SELECT s.*, p.price as current_price FROM user_subscriptions s JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.starts_at <= datetime('now') AND s.expires_at > datetime('now') ORDER BY p.price DESC LIMIT 1"
+      "SELECT s.*, p.price as current_price, p.token_quota as current_token_quota FROM user_subscriptions s JOIN plans p ON s.plan_id = p.id WHERE s.user_id = ? AND s.status = 'active' AND s.starts_at <= datetime('now') AND s.expires_at > datetime('now') ORDER BY p.price DESC LIMIT 1"
     ).get(req.userId);
 
-    if (activeSub && plan.price <= activeSub.current_price) {
+    if (activeSub && plan.token_quota <= activeSub.current_token_quota) {
       return res.status(400).json({ error: '当前套餐等级已等于或高于所选套餐，无法购买' });
+    }
+
+    // 升级场景：只收差价
+    const actualAmount = activeSub ? Math.max(plan.price - activeSub.current_price, 0) : plan.price;
+    if (activeSub && actualAmount <= 0) {
+      return res.status(400).json({ error: '升级差价为零，无需支付' });
     }
 
     const orderId = uuidv4();
     db.prepare(
       'INSERT INTO orders (id, user_id, plan_id, amount, payment_method, status) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(orderId, req.userId, plan.id, plan.price, payment_method, 'pending');
+    ).run(orderId, req.userId, plan.id, actualAmount, payment_method, 'pending');
 
-    console.log(`[Payment] Order created: ${orderId}, plan=${plan.name}, amount=${plan.price}, user=${req.userId}`);
+    console.log(`[Payment] Order created: ${orderId}, plan=${plan.name}, amount=${actualAmount}${activeSub ? ` (upgrade from ${activeSub.current_price})` : ''}, user=${req.userId}`);
 
     // 调用支付适配层
     payment.createOrder({
       orderId,
-      amount: plan.price,
-      subject: plan.name,
+      amount: actualAmount,
+      subject: activeSub ? `升级至${plan.name}` : plan.name,
       paymentMethod: payment_method,
     }).then(result => {
       // 更新 trade_no

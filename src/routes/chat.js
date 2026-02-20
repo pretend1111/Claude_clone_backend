@@ -15,13 +15,65 @@ const { parseFile, needsParsing, getFormatLabel } = require('../tools/file-parse
 
 const router = express.Router();
 
+async function generateThinkingSummary(thinkingContent) {
+  if (!thinkingContent || thinkingContent.length < 50) return null;
+
+  let poolKey = null;
+  try {
+    poolKey = keyPool.acquire();
+    const apiKey = poolKey ? poolKey.api_key : config.API_KEY;
+    const baseUrl = poolKey ? poolKey.base_url : config.API_BASE_URL;
+    const url = `${baseUrl}/v1/messages`;
+
+    // 截断过长的思考内容以节省 token
+    const truncatedThinking = thinkingContent.length > 15000 
+      ? thinkingContent.slice(0, 15000) + '...' 
+      : thinkingContent;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 100,
+        messages: [
+          {
+            role: 'user',
+            content: `请将以下思考过程总结为一句话（中文，20字以内），描述模型分析了什么或考虑了什么。例如"分析了兼容性问题并诊断了原因"。不要使用"我"或"模型"作为主语，直接以动词开头。不要包含任何标点符号（句号除外）。\n\n思考内容：\n${truncatedThinking}`
+          }
+        ]
+      })
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      if (data.content && Array.isArray(data.content)) {
+        const textBlock = data.content.find((block) => block.type === 'text' && block.text);
+        if (textBlock && textBlock.text) {
+          return textBlock.text.replace(/^["']|["']$/g, '').trim();
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to generate thinking summary:', err);
+  } finally {
+    if (poolKey) keyPool.release(poolKey.id);
+  }
+  return null;
+}
+
 /**
  * 流式请求一轮：实时转发 thinking 事件给前端（spinning logo），
  * 缓冲 text 事件，累积 tool_use，返回完整消息对象。
  * 兼容中转 API（即使 stream:true 也能正常工作）。
  */
-async function streamToolRound(res, fetchUrl, fetchHeaders, reqBody, controller, isClientClosed, emitMessageStart) {
+async function streamToolRound(res, fetchUrl, fetchHeaders, reqBody, controller, isClientClosed, emitMessageStart, pendingTasks, onThinkingSummary) {
   const bodyStr = JSON.stringify({ ...reqBody, stream: true });
+  const _fetchStart = Date.now();
   console.log(`[Chat] streamToolRound: url=${fetchUrl}, bodySize=${Math.round(bodyStr.length/1024)}KB, model=${reqBody.model}`);
   const response = await fetch(fetchUrl, {
     method: 'POST',
@@ -29,6 +81,7 @@ async function streamToolRound(res, fetchUrl, fetchHeaders, reqBody, controller,
     body: bodyStr,
     signal: controller.signal,
   });
+  console.log(`[Chat][Timing] API响应头到达: ${Date.now() - _fetchStart}ms, status=${response.status}`);
 
   if (!response.ok) {
     const errText = await response.text();
@@ -44,10 +97,15 @@ async function streamToolRound(res, fetchUrl, fetchHeaders, reqBody, controller,
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
+  let _firstChunk = true;
 
   try {
     while (true) {
       const { done, value } = await reader.read();
+      if (_firstChunk && value) {
+        console.log(`[Chat][Timing] 首个SSE数据块到达: ${Date.now() - _fetchStart}ms`);
+        _firstChunk = false;
+      }
       if (done || isClientClosed()) break;
 
       sseBuffer += decoder.decode(value, { stream: true });
@@ -103,6 +161,21 @@ async function streamToolRound(res, fetchUrl, fetchHeaders, reqBody, controller,
         if (parsed.type === 'content_block_stop') {
           const idx = parsed.index;
           const bt = blockTypeMap[idx];
+          
+          // 如果 thinking 块结束，触发摘要生成
+          if (bt === 'thinking' && message.content[idx] && message.content[idx].thinking) {
+            const thinkingText = message.content[idx].thinking;
+            if (pendingTasks) {
+              const task = generateThinkingSummary(thinkingText).then(summary => {
+                if (summary) {
+                  res.write(`data: ${JSON.stringify({ type: 'thinking_summary', summary })}\n\n`);
+                  if (onThinkingSummary) onThinkingSummary(summary);
+                }
+              });
+              pendingTasks.push(task);
+            }
+          }
+
           if (bt === 'thinking' || bt === 'text') res.write(`data: ${JSON.stringify(parsed)}\n\n`);
           continue;
         }
@@ -228,6 +301,7 @@ async function generateTitle(conversationId, userMsg, assistantMsg) {
 }
 
 router.post('/', async (req, res, next) => {
+  const _t0 = Date.now();
   const { conversation_id: conversationId, message, attachments } = req.body || {};
 
   if (typeof conversationId !== 'string' || conversationId.length === 0) {
@@ -260,6 +334,7 @@ router.post('/', async (req, res, next) => {
     }
 
     // 三层额度检查（总额度 + 窗口 + 周预算）
+    console.log(`[Chat][Timing] 验证阶段: ${Date.now() - _t0}ms`);
     const quotaCheck = quotaEngine.checkQuota(req.userId);
     if (!quotaCheck.allowed) {
       return res.status(403).json({ error: quotaCheck.message, code: quotaCheck.reason, quota: quotaCheck.quota });
@@ -307,6 +382,7 @@ router.post('/', async (req, res, next) => {
     tx();
 
     // === 自动 compaction 检查 ===
+    console.log(`[Chat][Timing] 消息存储完成: ${Date.now() - _t0}ms`);
     let compactionResult = null;
     try {
       compactionResult = await contextManager.checkAndCompact(conversationId, req.userId);
@@ -315,6 +391,7 @@ router.post('/', async (req, res, next) => {
     }
 
     // 组装历史消息
+    console.log(`[Chat][Timing] compaction检查完成: ${Date.now() - _t0}ms`);
     const historyMessages = db
       .prepare(
         `
@@ -431,13 +508,14 @@ router.post('/', async (req, res, next) => {
       // 确保 content 数组中至少有一个 text block（部分中转 API 要求）
       const hasText = parts.some(p => p.type === 'text');
       if (!hasText && parts.length > 0) {
-        parts.push({ type: 'text', text: '请描述或分析上面的内容。' });
+        parts.push({ type: 'text', text: '（用户发送了图片，请查看并等待用户的进一步指示。如果用户没有其他文字说明，简要描述图片内容即可。不要调用任何工具。）' });
       }
 
       anthropicMessages.push({ role: row.role, content: parts });
     }
 
     const prunedMessages = contextManager.pruneMessages(anthropicMessages);
+    console.log(`[Chat][Timing] 消息组装+附件处理完成: ${Date.now() - _t0}ms, 消息数=${anthropicMessages.length}`);
 
     // === 图片压缩：中转 API 请求体不能超过约 10MB ===
     const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8MB base64 上限
@@ -496,12 +574,14 @@ router.post('/', async (req, res, next) => {
     const model = conversation.model || 'claude-opus-4-6-thinking';
     const controller = new AbortController();
     let clientClosed = false;
+    const pendingTasks = []; // 用于追踪异步任务（如 thinking 摘要生成）
 
     // 从密钥池获取密钥，池为空时回退到 config
     const poolKey = keyPool.acquire(conversationId);
     const activeApiKey = poolKey ? poolKey.api_key : config.API_KEY;
     const activeBaseUrl = poolKey ? poolKey.base_url : config.API_BASE_URL;
     const url = `${activeBaseUrl}/v1/messages`;
+    console.log(`[Chat][Timing] 使用密钥: poolKey=${poolKey ? poolKey.id : 'none'}, baseUrl=${activeBaseUrl}, apiKey=${activeApiKey.substring(0, 10)}...`);
     const systemPrompt = getSystemPrompt(req.userId, model);
     const toolDefinitions = toolRegistry.getToolDefinitions();
     const hasTools = toolRegistry.hasTools();
@@ -512,6 +592,7 @@ router.post('/', async (req, res, next) => {
     let totalCacheReadTokens = 0;
 
     // === 步骤 B：设置 SSE 响应头 ===
+    console.log(`[Chat][Timing] 初始化完成，准备发起API请求: ${Date.now() - _t0}ms`);
     res.status(200);
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache');
@@ -537,6 +618,10 @@ router.post('/', async (req, res, next) => {
     let assistantMessage = '';
     let usageData = null;
     let createdDocument = null;
+    let thinkingContent = '';
+    let thinkingSummary = null;
+    let citationSources = [];
+    let searchLogs = [];
 
     try {
       // === 步骤 C：流式工具循环 ===
@@ -566,6 +651,7 @@ router.post('/', async (req, res, next) => {
           if (includeTools) reqBody.tools = toolDefinitions;
 
           console.log(`[Chat] 工具循环第 ${loopRound} 轮, includeTools=${includeTools}`);
+          const _roundStart = Date.now();
 
           // 带重试的流式请求（502/503 等临时错误自动重试）
           const RETRYABLE_LOOP = new Set([429, 500, 502, 503, 522, 524]);
@@ -580,7 +666,9 @@ router.post('/', async (req, res, next) => {
             }
             roundResult = await streamToolRound(
               res, url, fetchHeaders, reqBody, controller,
-              () => clientClosed, loopRound === 1
+              () => clientClosed, loopRound === 1,
+              pendingTasks,
+              (summary) => { thinkingSummary = summary; }
             );
             if (roundResult.ok) break;
             console.error(`[Chat] 请求失败 (attempt ${attempt + 1}):`, roundResult.status, (roundResult.errorText || '').substring(0, 200));
@@ -620,6 +708,9 @@ router.post('/', async (req, res, next) => {
               if (block.type === 'text') {
                 assistantMessage += block.text.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
               }
+              if (block.type === 'thinking' && block.thinking) {
+                thinkingContent += (thinkingContent ? '\n\n' : '') + block.thinking;
+              }
             }
             usageData = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens, cache_creation_tokens: totalCacheCreationTokens, cache_read_tokens: totalCacheReadTokens };
             break;
@@ -627,7 +718,7 @@ router.post('/', async (req, res, next) => {
 
           if (stopReason === 'tool_use') {
             const toolUseBlocks = contentBlocks.filter((b) => b.type === 'tool_use');
-            console.log(`[Chat] 模型请求工具调用: ${toolUseBlocks.map(b => b.name).join(', ')}`);
+            console.log(`[Chat] 模型请求工具调用: ${toolUseBlocks.map(b => b.name).join(', ')}, API耗时: ${Date.now() - _roundStart}ms`);
 
             for (const tu of toolUseBlocks) {
               if (tu.name === 'search_internet' && tu.input && tu.input.query) {
@@ -642,23 +733,64 @@ router.post('/', async (req, res, next) => {
 
             workingMessages.push({ role: 'assistant', content: contentBlocks });
             const toolContext = { userId: req.userId };
+            const _toolStart = Date.now();
             const toolResults = await toolExecutor.executeAll(toolUseBlocks, toolContext);
+            console.log(`[Chat][Timing] 工具执行耗时: ${Date.now() - _toolStart}ms, 工具: ${toolUseBlocks.map(b => b.name).join(', ')}`);
 
-            const allSources = [];
-            for (const tr of toolResults) {
-              if (tr._meta && tr._meta.sources) allSources.push(...tr._meta.sources);
+            for (let i = 0; i < toolResults.length; i++) {
+              const tr = toolResults[i];
+              const tu = toolUseBlocks[i];
+
+              if (tr._meta && tr._meta.sources && tr._meta.sources.length > 0) {
+                const sources = tr._meta.sources;
+                const query = (tu.name === 'search_internet') ? tu.input.query : null;
+                
+                citationSources.push(...sources);
+                if (query) {
+                  searchLogs.push({ query, results: sources });
+                }
+                res.write(`data: ${JSON.stringify({ type: 'search_sources', sources, query })}\n\n`);
+              }
+
               if (tr._meta && tr._meta._document) {
                 createdDocument = tr._meta._document;
                 res.write(`data: ${JSON.stringify({ type: 'document_created', document: tr._meta._document })}\n\n`);
               }
             }
-            if (allSources.length > 0) {
-              res.write(`data: ${JSON.stringify({ type: 'search_sources', sources: allSources })}\n\n`);
-            }
 
             const cleanResults = toolResults.map(({ _meta, ...rest }) => rest);
             workingMessages.push({ role: 'user', content: cleanResults });
             continue;
+          }
+
+          // 兼容中转站自行处理 tool_use 的情况
+          // （stop_reason=end_turn 但 contentBlocks 中仍包含 tool_use 块，说明中转站做了搜索但没走标准 tool_use 流程）
+          const relayToolBlocks = contentBlocks.filter((b) => b.type === 'tool_use');
+          if (relayToolBlocks.length > 0) {
+            console.log(`[Chat] 中转站自行处理了工具调用: ${relayToolBlocks.map(b => b.name).join(', ')}`);
+            try {
+              const toolContext = { userId: req.userId };
+              const toolResults = await toolExecutor.executeAll(relayToolBlocks, toolContext);
+              for (let i = 0; i < toolResults.length; i++) {
+                const tr = toolResults[i];
+                const tu = relayToolBlocks[i];
+                if (tr._meta && tr._meta.sources && tr._meta.sources.length > 0) {
+                  const sources = tr._meta.sources;
+                  const query = (tu.name === 'search_internet') ? tu.input.query : null;
+                  citationSources.push(...sources);
+                  if (query) {
+                    searchLogs.push({ query, results: sources });
+                  }
+                  res.write(`data: ${JSON.stringify({ type: 'search_sources', sources, query })}\n\n`);
+                }
+                if (tr._meta && tr._meta._document) {
+                  createdDocument = tr._meta._document;
+                  res.write(`data: ${JSON.stringify({ type: 'document_created', document: tr._meta._document })}\n\n`);
+                }
+              }
+            } catch (e) {
+              console.error('[Chat] 中转站工具补偿执行失败:', e.message);
+            }
           }
 
           // end_turn — text 已实时转发，无需额外刷新
@@ -673,6 +805,9 @@ router.post('/', async (req, res, next) => {
             if (block.type === 'text') {
               assistantMessage += block.text.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
             }
+            if (block.type === 'thinking' && block.thinking) {
+              thinkingContent += (thinkingContent ? '\n\n' : '') + block.thinking;
+            }
           }
           usageData = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens, cache_creation_tokens: totalCacheCreationTokens, cache_read_tokens: totalCacheReadTokens };
           break;
@@ -680,6 +815,16 @@ router.post('/', async (req, res, next) => {
       }
     } finally {
       // === 步骤 E：保存到数据库 + 释放密钥池 ===
+      
+      // 等待所有异步任务完成（如 thinking 摘要）
+      if (pendingTasks && pendingTasks.length > 0) {
+        try {
+          await Promise.all(pendingTasks);
+        } catch (e) {
+          console.error('[Chat] Error waiting for pending tasks:', e);
+        }
+      }
+
       res.end();
 
       // 释放密钥池并记录结果
@@ -694,9 +839,12 @@ router.post('/', async (req, res, next) => {
         try {
           const msgId = uuidv4();
           const documentJson = createdDocument ? JSON.stringify(createdDocument) : null;
+          const thinkingValue = thinkingContent || null;
+          const citationsJson = citationSources.length > 0 ? JSON.stringify(citationSources) : null;
+          const searchLogsJson = searchLogs.length > 0 ? JSON.stringify(searchLogs) : null;
           db.prepare(
-            'INSERT INTO messages (id, conversation_id, role, content, has_attachments, document_json) VALUES (?, ?, ?, ?, ?, ?)'
-          ).run(msgId, conversationId, 'assistant', assistantMessage, 0, documentJson);
+            'INSERT INTO messages (id, conversation_id, role, content, has_attachments, document_json, thinking, thinking_summary, citations_json, search_logs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          ).run(msgId, conversationId, 'assistant', assistantMessage, 0, documentJson, thinkingValue, thinkingSummary, citationsJson, searchLogsJson);
 
           if (usageData) {
             contextManager.saveTokenUsage(msgId, messageId, usageData);

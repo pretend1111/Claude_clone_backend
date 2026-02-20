@@ -68,7 +68,7 @@ function maybeResetCounters(db, sub) {
   if (updates.length > 0) {
     db.prepare(`UPDATE user_subscriptions SET ${updates.join(', ')} WHERE id = ?`).run(...values, sub.id);
     // Re-fetch
-    return db.prepare("SELECT s.*, p.window_budget, p.weekly_budget, p.name as plan_name FROM user_subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.id = ?").get(sub.id);
+    return db.prepare("SELECT s.*, p.window_budget, p.weekly_budget, p.name as plan_name, p.plan_type FROM user_subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.id = ?").get(sub.id);
   }
   return sub;
 }

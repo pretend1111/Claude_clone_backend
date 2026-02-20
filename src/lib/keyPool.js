@@ -34,7 +34,7 @@ function reload() {
 /**
  * 获取密钥，支持对话亲和（同一对话固定用同一个 key，利用中转站缓存）
  * @param {string} [conversationId] - 对话 ID，传入则启用亲和
- * @returns {{ id, api_key, base_url } | null}
+ * @returns {{ id, api_key, base_url, group_multiplier } | null}
  */
 function acquire(conversationId) {
   if (!initialized) init();
